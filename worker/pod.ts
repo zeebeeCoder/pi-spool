@@ -5,12 +5,20 @@
 //   node worker/pod.ts spawn --task ALD-1 --step <id> --assignment "<text>"
 //                            [--cwd <dir>] [--tools read,bash] [--wait]
 //   node worker/pod.ts status <taskID>
+//   node worker/pod.ts fanout --task ALD-1 --step <id> --plan pods.json [--worktree-base <dir>] [--wait]
+//
+// Phase 2: `fanout` runs a coordinator as an Absurd task on its own queue. It
+// prepares one git worktree per pod, spawns the pods, and awaits each result
+// through a checkpointed wait, so the coordinator can die and resume as well.
 //
 // What Absurd supplies here is supervision: a lease, retry after the process
 // dies, an awaitable result, and per-message checkpoints visible in absurdctl
 // or Habitat. What Pi supplies is the durable message log itself: the pod's
 // session file. On retry the pod reopens that file and continues.
 // Spool records the boundaries so the trace shows the pod beside human sessions.
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { Absurd, type TaskContext } from "absurd-sdk";
 import {
@@ -27,6 +35,8 @@ import {
 
 export const POD_QUEUE = "spool_pods";
 export const POD_TASK = "spool-pod";
+export const FANOUT_QUEUE = "spool_fanout";
+export const FANOUT_TASK = "spool-fanout";
 const CLAIM_TIMEOUT_SECONDS = Number(process.env.POD_CLAIM_TIMEOUT ?? 300);
 
 export interface PodParams {
@@ -60,6 +70,149 @@ absurd.registerTask<PodParams, { sessionFile: string; messages: number; summary:
   { name: POD_TASK, defaultMaxAttempts: 5 },
   async (params, ctx) => runPod(params, ctx),
 );
+
+export interface PodPlan {
+  stepId: string;
+  title?: string;
+  assignment: string;
+  tools?: string[];
+  cwd?: string;
+}
+
+export interface FanoutParams {
+  vault: string;
+  taskId: string;
+  canonicalPath: string;
+  stepId: string;
+  title?: string;
+  repo: string;
+  worktreeBase?: string;
+  pods: PodPlan[];
+}
+
+interface PodOutcome {
+  stepId: string;
+  taskID: string;
+  cwd: string;
+  state: string;
+  summary: string | null;
+}
+
+const fanout = new Absurd({ db: pool, queueName: FANOUT_QUEUE });
+
+fanout.registerTask<FanoutParams, { pods: PodOutcome[] }>(
+  { name: FANOUT_TASK, defaultMaxAttempts: 5 },
+  async (params, ctx) => runFanout(params, ctx),
+);
+
+async function runFanout(params: FanoutParams, ctx: TaskContext) {
+  const log = (line: string) => console.error(`[fanout ${params.stepId}] ${line}`);
+  const goal = await spool.attach({
+    vault: params.vault,
+    taskId: params.taskId,
+    canonicalPath: params.canonicalPath,
+  });
+  const binding = {
+    version: 1 as const,
+    workId: goal.workId,
+    vault: params.vault,
+    taskId: params.taskId,
+    canonicalPath: params.canonicalPath,
+  };
+  const identity: RuntimeIdentity = {
+    piSessionId: `fanout:${ctx.taskID}`,
+    piSessionName: `coordinator:${params.stepId}`,
+    piSessionFile: null,
+    runtimeId: "00000000-0000-4000-8000-0000000000fa",
+  };
+
+  await ctx.step("note-start", async () => {
+    await spool.note(binding, identity, {
+      stepId: params.stepId,
+      title: params.title,
+      summary: `Coordinator started as Absurd task ${ctx.taskID.slice(0, 8)}; fanning out ${params.pods.length} pod(s)`,
+      evidenceRef: `absurd-task:${ctx.taskID}`,
+      nextAction: "Wait for every pod result; the coordinator records done when all have landed",
+    });
+    return true;
+  });
+
+  // One worktree per pod, created once. A retry reuses them.
+  const cwds = await ctx.step<Record<string, string>>("worktrees", async () => {
+    const result: Record<string, string> = {};
+    for (const pod of params.pods) {
+      if (pod.cwd) {
+        result[pod.stepId] = pod.cwd;
+        continue;
+      }
+      if (!params.worktreeBase) {
+        result[pod.stepId] = params.repo;
+        continue;
+      }
+      const dir = join(params.worktreeBase, pod.stepId);
+      if (!existsSync(dir)) {
+        execFileSync("git", ["worktree", "add", "--detach", dir, "HEAD"], {
+          cwd: params.repo,
+          stdio: "pipe",
+        });
+        log(`worktree ${dir}`);
+      }
+      result[pod.stepId] = dir;
+    }
+    return result;
+  });
+
+  // Spawn every pod. Idempotency keys make this safe to repeat after a crash.
+  const spawned: Record<string, string> = {};
+  for (const pod of params.pods) {
+    spawned[pod.stepId] = await ctx.step<string>(`spawn:${pod.stepId}`, async () => {
+      const result = await absurd.spawn(
+        POD_TASK,
+        {
+          vault: params.vault,
+          taskId: params.taskId,
+          canonicalPath: params.canonicalPath,
+          stepId: pod.stepId,
+          title: pod.title,
+          assignment: pod.assignment,
+          cwd: cwds[pod.stepId]!,
+          tools: pod.tools,
+        } satisfies PodParams,
+        { idempotencyKey: `pod:${params.vault}:${params.taskId}:${pod.stepId}` },
+      );
+      log(`spawned ${pod.stepId} as ${result.taskID.slice(0, 8)}${result.created ? "" : " (existing)"}`);
+      return result.taskID;
+    });
+  }
+
+  // Await each result. The wait itself is a checkpoint, so a resumed
+  // coordinator skips pods that already answered.
+  const outcomes: PodOutcome[] = [];
+  for (const pod of params.pods) {
+    const taskID = spawned[pod.stepId]!;
+    const snapshot = await ctx.awaitTaskResult(taskID, {
+      queue: POD_QUEUE,
+      stepName: `await:${pod.stepId}`,
+    });
+    const summary =
+      snapshot.state === "completed" && snapshot.result && typeof snapshot.result === "object"
+        ? String((snapshot.result as { summary?: unknown }).summary ?? "")
+        : null;
+    outcomes.push({ stepId: pod.stepId, taskID, cwd: cwds[pod.stepId]!, state: snapshot.state, summary });
+    log(`${pod.stepId} ${snapshot.state}`);
+  }
+
+  await ctx.step("note-done", async () => {
+    const completed = outcomes.filter((o) => o.state === "completed").length;
+    await spool.done(binding, identity, {
+      stepId: params.stepId,
+      summary: `${completed}/${outcomes.length} pod(s) completed: ${outcomes.map((o) => `${o.stepId}=${o.state}`).join(", ")}`,
+      evidenceRef: outcomes.map((o) => `absurd-task:${o.taskID}`).join("; "),
+    });
+    return true;
+  });
+  return { pods: outcomes };
+}
 
 async function runPod(params: PodParams, ctx: TaskContext) {
   const log = (line: string) => console.error(`[pod ${params.stepId}] ${line}`);
@@ -218,19 +371,31 @@ async function main(): Promise<void> {
       tools: { type: "string" },
       wait: { type: "boolean", default: false },
       vault: { type: "string" },
+      plan: { type: "string" },
+      "worktree-base": { type: "string" },
+      concurrency: { type: "string" },
     },
   });
   const command = positionals[0];
   if (command === "serve") {
+    const concurrency = Number(values.concurrency ?? 3);
     const worker = await absurd.startWorker({
       workerId: `pod-worker:${process.pid}`,
       claimTimeout: CLAIM_TIMEOUT_SECONDS,
-      concurrency: 1,
+      concurrency,
       onError: (error) => console.error(`[worker] ${error.message}`),
     });
-    console.error(`[worker] serving ${POD_QUEUE} as pid ${process.pid}`);
+    const coordinator = await fanout.startWorker({
+      workerId: `fanout-worker:${process.pid}`,
+      claimTimeout: CLAIM_TIMEOUT_SECONDS,
+      concurrency: 1,
+      onError: (error) => console.error(`[fanout-worker] ${error.message}`),
+    });
+    console.error(
+      `[worker] serving ${POD_QUEUE} (x${concurrency}) and ${FANOUT_QUEUE} as pid ${process.pid}`,
+    );
     const stop = async () => {
-      await worker.close();
+      await Promise.all([worker.close(), coordinator.close()]);
       await spool.close();
       process.exit(0);
     };
@@ -267,13 +432,51 @@ async function main(): Promise<void> {
     await spool.close();
     return;
   }
-  if (command === "status") {
-    const taskID = required("taskID", positionals[1]);
-    console.log(JSON.stringify(await absurd.fetchTaskResult(taskID, { queue: POD_QUEUE }), null, 2));
+  if (command === "fanout") {
+    const taskId = required("task", values.task);
+    const stepId = required("step", values.step);
+    const planPath = required("plan", values.plan);
+    const pods = JSON.parse(readFileSync(planPath, "utf8")) as PodPlan[];
+    if (!Array.isArray(pods) || pods.length === 0) {
+      console.error("plan must be a non-empty JSON array of {stepId, assignment, ...}");
+      process.exit(2);
+    }
+    const view = await spool.peek(
+      { taskId, vault: values.vault },
+      { piSessionId: "fanout-cli", piSessionName: null, piSessionFile: null, runtimeId: "00000000-0000-4000-8000-0000000000fa" },
+    );
+    const params: FanoutParams = {
+      vault: view.goal.vault,
+      taskId: view.goal.taskId,
+      canonicalPath: view.goal.canonicalPath,
+      stepId,
+      title: values.title,
+      repo: resolve(values.cwd ?? process.cwd()),
+      worktreeBase: values["worktree-base"] ? resolve(values["worktree-base"]) : undefined,
+      pods,
+    };
+    const spawned = await fanout.spawn(FANOUT_TASK, params, {
+      idempotencyKey: `fanout:${params.vault}:${params.taskId}:${params.stepId}`,
+    });
+    console.log(JSON.stringify(spawned, null, 2));
+    if (values.wait) {
+      const result = await fanout.awaitTaskResult(spawned.taskID, { queue: FANOUT_QUEUE });
+      console.log(JSON.stringify(result, null, 2));
+    }
     await spool.close();
     return;
   }
-  console.error("usage: pod serve | spawn --task --step --assignment [--cwd] [--tools] [--wait] | status <taskID>");
+  if (command === "status") {
+    const taskID = required("taskID", positionals[1]);
+    const pod = await absurd.fetchTaskResult(taskID, { queue: POD_QUEUE });
+    const parent = pod ? null : await fanout.fetchTaskResult(taskID, { queue: FANOUT_QUEUE });
+    console.log(JSON.stringify(pod ?? parent, null, 2));
+    await spool.close();
+    return;
+  }
+  console.error(
+    "usage: pod serve [--concurrency n] | spawn --task --step --assignment [--cwd] [--tools] [--wait] | fanout --task --step --plan <file> [--worktree-base <dir>] [--wait] | status <taskID>",
+  );
   process.exit(2);
 }
 

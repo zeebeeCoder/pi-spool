@@ -135,10 +135,24 @@ after every message. A fresh compose volume installs the vendored Absurd
 schema (`sql/vendor`, checksum-tested) and the `spool_pods` queue. On an
 existing volume run `select absurd.create_queue('spool_pods','unpartitioned')`.
 
-Phase 1 evidence on 2026-09-09: a pod killed with SIGKILL at message 17
-resumed on attempt 2 from the same session file with no repeated tool call.
-Phases 2 (coordinator fan-out with awaited results) and 3 (review gate via
-`awaitEvent`) are next.
+A coordinator can fan out to several pods and await them, as an Absurd task
+on its own queue so it survives dying too:
+
+```bash
+npm run pod -- fanout --task ALD-1 --step ald1.review-pack \
+  --plan pods.json --worktree-base ../.worktrees/pi-spool --wait
+```
+
+`pods.json` is an array of `{stepId, title, assignment, tools?, cwd?}`. The
+coordinator creates one detached git worktree per pod (once, checkpointed),
+spawns each pod with an idempotency key, awaits each result through a
+checkpointed wait, and records a Spool `done` listing every pod's state.
+
+Evidence on 2026-09-09. Phase 1: a pod SIGKILLed at message 17 resumed on
+attempt 2 from the same session file with no repeated tool call. Phase 2:
+SIGKILL with the coordinator and three pods running; all four resumed on
+attempt 2, each pod finished its twelve reads with none repeated, and the
+coordinator reported 3/3. Phase 3, a review gate via `awaitEvent`, is next.
 
 ## Storage
 

@@ -9,6 +9,9 @@
   checksum test, and compose installs it plus the queue on a fresh volume.
 - Phase 1 kill test passed: SIGKILL at message 17, attempt 2 resumed from the
   same session file with no repeated tool call.
+- `fanout`: a coordinator task on queue `spool_fanout` creates a worktree per
+  pod, spawns pods idempotently, and awaits each result as a checkpoint.
+  Phase 2 kill test passed with the coordinator and three pods in flight.
 
 ## 0.2.0-experimental.1 — 2026-09-09
 

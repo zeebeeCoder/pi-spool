@@ -1,12 +1,36 @@
 # Changelog
 
+## 0.2.0-experimental.1 — 2026-09-09
+
+Thin work log. Replaces the Absurd-backed lease and claim protocol.
+
+- `spool` has three actions: `resume`, `note`, `done`. Removed: `attach`,
+  `materialize`, `claim`, `report`, `checkpoint`, `heartbeat`, `status`,
+  `complete`. Attachment happens through `resume` with `canonicalPath`; the
+  task ID is read from the file's frontmatter.
+- Storage is an append-only `spool.events` table plus `works` and `steps`.
+  Step state is derived from the latest event. No queue, lease, or attempt.
+- Concurrent sessions on one step receive an advisory `warning`; no write is
+  ever refused on ownership grounds.
+- `resume` is capped at 12 steps and 6 KB. Tool output cap is 8 KB.
+- Dropped `absurd-sdk` and the vendored Absurd schema. `spool.json` needs only
+  `databaseUrl`; a stale `queueName` is ignored.
+- `sql/migrations/002-thin-events.sql` migrates a v1 database additively and
+  backfills history from attempts, reports, and Absurd checkpoints.
+- `/spool` browser shows goals, steps, and per-step history; sort cycling and
+  the technical-details toggle are gone.
+- `resume` with no attached goal returns an overview of every goal; `taskId`
+  peeks at another goal without attaching; `scope: "all"` forces the overview.
+- `bin/spool.ts` (`npm run spool`) exposes the same three actions to non-Pi
+  agents such as Claude Code, with identity from `SPOOL_SESSION_ID`.
+
+Why: in live use on 2026-09-09 a single shared FIFO queue let one goal's
+unclaimed step block two other goals, a mismatched claim rolled back Absurd's
+expiry sweep so a stale lease could never clear, and the protocol consumed the
+agent's attention. See README "Why v2 replaced the Absurd-backed v1".
+
 ## 0.1.0-experimental.1 — 2026-09-09
 
-First controlled experimental release of the single-agent `spool` tool.
-
-- Adds explicit canonical-goal attachment, durable step materialization, queue-first claiming, checkpoint/status/resume, explicit heartbeat, and execution completion backed by Absurd 0.5.0.
-- Adds machine configuration at `<Pi agent dir>/spool.json`, with individual environment-variable overrides and lazy database connection.
-- Bounds PostgreSQL connection, statement, query-read, and shutdown waits; uncertain commit acknowledgement fails closed without automatic retry.
-- Publishes strict action-specific field constraints and bounded resume output.
-
-Live evidence covers a graceful same-session Pi restart, a replacement run, and reuse of the original checkpoint. It does not prove SIGKILL recovery or independent continuation from a fresh Pi session. Reviewed acceptance, plan revision, timeline/history, and today/attention views are not implemented.
+First controlled experimental release of the single-agent `spool` tool backed
+by Absurd 0.5.0 with attach, materialize, claim, checkpoint, heartbeat, status,
+resume, report, and complete.

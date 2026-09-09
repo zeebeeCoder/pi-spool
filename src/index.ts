@@ -8,161 +8,118 @@ import {
 import { Type } from "typebox";
 import {
   SPOOL_BINDING_ENTRY,
+  readCanonicalTaskReference,
   restoreBinding,
-  validateCanonicalTaskReference,
   type SessionBinding,
 } from "./binding.ts";
 import { readSpoolConfig, type SpoolConfig } from "./config.ts";
 import { SpoolDashboardReader } from "./dashboard-data.ts";
-import {
-  runSpoolDashboard,
-  type DashboardReaderLike,
-} from "./dashboard-ui.ts";
-import {
-  PkmReferenceReader,
-  type PkmReferenceReaderLike,
-} from "./pkm-reference.ts";
+import { runSpoolDashboard, type DashboardReaderLike } from "./dashboard-ui.ts";
+import { PkmReferenceReader, type PkmReferenceReaderLike } from "./pkm-reference.ts";
 import {
   SpoolService,
-  isClaimUnavailable,
   spoolUserFacingError,
-  type ClaimNextResult,
+  type OverviewPacket,
+  type RecordResult,
   type ResumePacket,
   type RuntimeIdentity,
-  type StepDefinition,
-  type StepReport,
   type WorkRecord,
 } from "./spool-service.ts";
 import {
+  FIELD_LIMITS,
   SPOOL_ACTIONS,
+  STEP_ID_PATTERN,
   parseSpoolToolInput,
   type SpoolToolInput,
 } from "./tool-contract.ts";
 
-const stableIdentifierPattern = "^[A-Za-z0-9][A-Za-z0-9._:-]*$";
+const stepIdPattern = STEP_ID_PATTERN.source;
 
 export const spoolParameters = Type.Object(
   {
     action: StringEnum([...SPOOL_ACTIONS], {
       description:
-        "Operation and field map: attach requires vault, taskId, canonicalPath, outcome; materialize requires stepId, title, contribution, criteria; claim allows expectedStepId and leaseSeconds; report requires stepId, disposition, summary, evidenceRef and allows nextAction; checkpoint requires checkpointName and evidenceRef and allows nextAction; heartbeat allows leaseSeconds; status/resume accept no other fields; complete requires resultRef and summary (not outcome).",
+        "resume: where work stands. With no attached goal it lists all goals; with canonicalPath it attaches a PKM task; with taskId it peeks at another goal without attaching; scope=all forces the overview. note: record progress on a step. done: mark a step finished.",
     }),
-    vault: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 100,
-        description: "Attach only (required): non-empty, max 100 characters.",
-      }),
-    ),
-    taskId: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 100,
-        description: "Attach only (required): non-empty, max 100 characters.",
-      }),
-    ),
     canonicalPath: Type.Optional(
       Type.String({
         minLength: 1,
-        maxLength: 2_000,
-        description: "Attach only (required): non-empty, max 2000 characters.",
+        maxLength: FIELD_LIMITS.canonicalPath,
+        description:
+          "resume only: absolute path of the PKM task file to attach; its frontmatter id becomes the task ID.",
+      }),
+    ),
+    vault: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: FIELD_LIMITS.vault,
+        description:
+          "resume only, optional: vault name when it cannot be derived from a vaults/<name>/ path segment.",
       }),
     ),
     outcome: Type.Optional(
       Type.String({
         minLength: 1,
-        maxLength: 500,
+        maxLength: FIELD_LIMITS.outcome,
+        description: "resume only, optional: one sentence on the desired outcome.",
+      }),
+    ),
+    taskId: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: FIELD_LIMITS.taskId,
         description:
-          "Attach only (required): non-empty, max 500 characters; never pass to complete.",
+          "resume only, optional: PKM task ID of another goal to view read-only without changing this session's attachment (add vault if ambiguous).",
+      }),
+    ),
+    scope: Type.Optional(
+      StringEnum(["goal", "all"], {
+        description:
+          "resume only, optional: all returns the overview of every goal even when this session is attached.",
       }),
     ),
     stepId: Type.Optional(
       Type.String({
         minLength: 1,
-        maxLength: 100,
-        pattern: stableIdentifierPattern,
+        maxLength: FIELD_LIMITS.stepId,
+        pattern: stepIdPattern,
         description:
-          "Materialize or report (required): max 100 characters; start alphanumeric, then letters, digits, ., _, :, or -.",
+          "note/done: stable step identifier (letters, digits, . _ : -). A new ID creates the step.",
       }),
     ),
     title: Type.Optional(
       Type.String({
         minLength: 1,
-        maxLength: 200,
-        description: "Materialize only (required): non-empty, max 200 characters.",
-      }),
-    ),
-    contribution: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 500,
-        description: "Materialize only (required): non-empty, max 500 characters.",
-      }),
-    ),
-    criteria: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 500,
-        description: "Materialize only (required): non-empty, max 500 characters.",
-      }),
-    ),
-    expectedStepId: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 100,
-        pattern: stableIdentifierPattern,
-        description:
-          "Claim only (optional): max 100 characters; start alphanumeric, then letters, digits, ., _, :, or -.",
-      }),
-    ),
-    leaseSeconds: Type.Optional(
-      Type.Integer({
-        minimum: 1,
-        maximum: 3_600,
-        description: "Optional for claim or heartbeat; rejected otherwise.",
-      }),
-    ),
-    disposition: Type.Optional(
-      StringEnum(["in_progress", "finished"], {
-        description: "Report only (required): in_progress or finished.",
-      }),
-    ),
-    checkpointName: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 100,
-        pattern: stableIdentifierPattern,
-        description:
-          "Checkpoint only (required): max 100 characters; start alphanumeric, then letters, digits, ., _, :, or -.",
-      }),
-    ),
-    evidenceRef: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 1_000,
-        description: "Checkpoint or report (required): non-empty, max 1000 characters.",
-      }),
-    ),
-    nextAction: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 500,
-        description: "Checkpoint or report (optional): non-empty, max 500 characters.",
-      }),
-    ),
-    resultRef: Type.Optional(
-      Type.String({
-        minLength: 1,
-        maxLength: 1_000,
-        description: "Complete only (required): non-empty, max 1000 characters.",
+        maxLength: FIELD_LIMITS.title,
+        description: "note only, optional: human title for a new step.",
       }),
     ),
     summary: Type.Optional(
       Type.String({
         minLength: 1,
-        maxLength: 500,
+        maxLength: FIELD_LIMITS.summary,
+        description: "note/done: what happened, in one or two sentences.",
+      }),
+    ),
+    evidenceRef: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: FIELD_LIMITS.evidenceRef,
         description:
-          "Report or complete (required): non-empty, max 500 characters.",
+          "note/done, optional: where the evidence lives (commit, file path, task ID).",
+      }),
+    ),
+    nextAction: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: FIELD_LIMITS.nextAction,
+        description: "note only, optional: what a resuming session should do next.",
+      }),
+    ),
+    reviewed: Type.Optional(
+      Type.Boolean({
+        description:
+          "done only, optional: true only when a human or coordinator has reviewed and accepted the result. Defaults to false.",
       }),
     ),
   },
@@ -170,52 +127,40 @@ export const spoolParameters = Type.Object(
 );
 
 export interface SpoolServiceLike {
-  attach(
-    input: {
-      vault: string;
-      taskId: string;
-      canonicalPath: string;
-      outcome: string;
-    },
-    identity: RuntimeIdentity,
-  ): Promise<WorkRecord>;
+  attach(input: {
+    vault: string;
+    taskId: string;
+    canonicalPath: string;
+    outcome?: string;
+  }): Promise<WorkRecord>;
   reconcileBinding(binding: SessionBinding): Promise<WorkRecord>;
-  materialize(
-    binding: SessionBinding,
-    definition: StepDefinition,
-  ): Promise<{ stepId: string; taskId: string; created: boolean }>;
-  claimNext(
-    binding: SessionBinding,
+  resume(binding: SessionBinding, identity: RuntimeIdentity): Promise<ResumePacket>;
+  overview(identity: RuntimeIdentity): Promise<OverviewPacket>;
+  peek(
+    reference: { taskId: string; vault?: string },
     identity: RuntimeIdentity,
-    options: { expectedStepId?: string; leaseSeconds: number },
-  ): Promise<ClaimNextResult>;
-  report(
+  ): Promise<ResumePacket>;
+  note(
     binding: SessionBinding,
     identity: RuntimeIdentity,
     input: {
       stepId: string;
-      disposition: "in_progress" | "finished";
+      title?: string;
       summary: string;
-      evidenceRef: string;
+      evidenceRef?: string;
       nextAction?: string;
     },
-  ): Promise<StepReport>;
-  checkpoint(
+  ): Promise<RecordResult>;
+  done(
     binding: SessionBinding,
     identity: RuntimeIdentity,
-    input: { checkpointName: string; evidenceRef: string; nextAction?: string },
-  ): Promise<void>;
-  heartbeat(
-    binding: SessionBinding,
-    identity: RuntimeIdentity,
-    leaseSeconds: number,
-  ): Promise<Date>;
-  completeExecution(
-    binding: SessionBinding,
-    identity: RuntimeIdentity,
-    input: { resultRef: string; summary: string },
-  ): Promise<void>;
-  resume(binding: SessionBinding, identity: RuntimeIdentity): Promise<ResumePacket>;
+    input: {
+      stepId: string;
+      summary: string;
+      evidenceRef?: string;
+      reviewed?: boolean;
+    },
+  ): Promise<RecordResult>;
   close(): Promise<void>;
 }
 
@@ -226,7 +171,7 @@ export interface SpoolExtensionDependencies {
   createService?: (config: SpoolConfig) => SpoolServiceLike;
   createDashboardReader?: (config: SpoolConfig) => DashboardReaderLike;
   createPkmReferenceReader?: () => PkmReferenceReaderLike;
-  validateTaskReference?: typeof validateCanonicalTaskReference;
+  readTaskReference?: typeof readCanonicalTaskReference;
 }
 
 export function extractRuntimeIdentity(
@@ -236,19 +181,18 @@ export function extractRuntimeIdentity(
 ): RuntimeIdentity {
   return {
     piSessionId: ctx.sessionManager.getSessionId(),
-    piSessionName: pi.getSessionName(),
-    piSessionFile: ctx.sessionManager.getSessionFile(),
+    piSessionName: pi.getSessionName() ?? null,
+    piSessionFile: ctx.sessionManager.getSessionFile() ?? null,
     runtimeId,
   };
 }
 
 export const SPOOL_PROMPT_GUIDELINES = [
-  "Use spool only for consequential work that a later turn/session depends on, a durable wait, or an effect expensive to repeat; do not record private reasoning, routine tool calls, or micro-steps.",
-  "Spool records optional continuity. It authorizes mutations only to its owned execution record; user or coordinator authorization—not a Spool claim—authorizes coding, peer work, or external effects.",
-  "Use report only for an explicitly identified materialized step already underway or finished outside lease ownership. It is attributed, untracked, unverified status—not an attempt or acceptance—and its first safe write withdraws only that step's still-pending task; ownership or withdrawal uncertainty is a hard error.",
-  "Begin Spool tracking by attaching the explicit canonical goal. Before attempt-bound mutations, inspect durable state and claim the expected queue head. Fail closed on a real same-step owner, lost lease, storage failure, or uncertain external effect/commit.",
-  "A typed claim result with claimed:false, tracking:unavailable, reason:queue_head_mismatch, and rollback:confirmed acquires no ownership. Follow its nextAction once: unless strict tracking was explicitly required, continue otherwise authorized work through normal ownership/coordination untracked. Never loop claims, sweep, reorder, or take unrelated work merely to satisfy Spool; ownership, lease, admission, storage, and uncertain-effect failures remain hard errors.",
-  "Spool execution completion is not reviewed evidence acceptance; explain that distinction when reporting results.",
+  "spool is a work log, not a gate. It never authorizes or blocks work; keep attention on the goal and log only what a later session would need.",
+  "At the start of work on a PKM task, call spool resume with the task file's canonicalPath. Read the current step and next action, then continue the work. With no attached goal, spool resume lists every goal and where it stands; use taskId to look at one without attaching.",
+  "Record a spool note when a step starts, at a meaningful milestone, or before stopping; include a nextAction so the next session knows where to pick up. Do not log routine tool calls or reasoning.",
+  "Call spool done when a step's work is finished. Leave reviewed false unless a human or coordinator has accepted the result.",
+  "A warning in a spool result is information about other sessions, not an error. Mention it once and carry on.",
 ] as const;
 
 export function registerSpoolExtension(
@@ -256,8 +200,7 @@ export function registerSpoolExtension(
   dependencies: SpoolExtensionDependencies = {},
 ): void {
   const runtimeId = dependencies.runtimeId ?? randomUUID();
-  const validateTask =
-    dependencies.validateTaskReference ?? validateCanonicalTaskReference;
+  const readTask = dependencies.readTaskReference ?? readCanonicalTaskReference;
   let binding: SessionBinding | null = null;
   let service: SpoolServiceLike | null = null;
   let operationTail: Promise<void> = Promise.resolve();
@@ -276,7 +219,9 @@ export function registerSpoolExtension(
 
   const requireBinding = async (): Promise<SessionBinding> => {
     if (!binding) {
-      throw new Error("this session is not attached; call spool action=attach first");
+      throw new Error(
+        "this session has no attached goal; call spool resume with the task file's canonicalPath first",
+      );
     }
     const captured = { ...binding };
     await getService().reconcileBinding(captured);
@@ -304,7 +249,7 @@ export function registerSpoolExtension(
   };
 
   pi.registerCommand("spool", {
-    description: "Browse a read-only snapshot of the configured Spool queue",
+    description: "Browse the Spool work log",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
         const message = "/spool requires interactive Pi TUI mode";
@@ -314,7 +259,6 @@ export function registerSpoolExtension(
         }
         throw new Error(message);
       }
-
       let reader: DashboardReaderLike | undefined;
       try {
         const config = readSpoolConfig(
@@ -346,9 +290,8 @@ export function registerSpoolExtension(
     name: "spool",
     label: "Spool",
     description:
-      "Optionally record continuity for one consequential step: attach, materialize, claim, report attributed untracked progress, checkpoint, inspect, resume, heartbeat, or execution-complete. A Spool claim authorizes only its owned execution record, not the underlying user-approved work. Fields are action-specific: complete requires summary and resultRef, never outcome. Reports and checkpoints are not reviewed acceptance.",
-    promptSnippet:
-      "Durably attach and continue consequential work across Pi sessions",
+      "Work log for a PKM goal across Pi sessions. resume shows where the goal stands (pass canonicalPath once per session to attach). note records progress on a step. done marks a step finished. Never blocks work; warnings are advisory.",
+    promptSnippet: "Log progress on a PKM goal so a later session can resume it",
     promptGuidelines: [...SPOOL_PROMPT_GUIDELINES],
     parameters: spoolParameters,
     async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
@@ -359,12 +302,7 @@ export function registerSpoolExtension(
         try {
           const result = await executeAction(input, identity);
           return {
-            content: [
-              {
-                type: "text" as const,
-                text: renderSpoolResult(input.action, result),
-              },
-            ],
+            content: [{ type: "text" as const, text: renderSpoolResult(input.action, result) }],
             details: result,
           };
         } catch (error) {
@@ -376,8 +314,6 @@ export function registerSpoolExtension(
 
   const restoreBranchBinding = async (ctx: ExtensionContext): Promise<void> => {
     await enqueueOperation(undefined, async () => {
-      // Restore lineage only. Durable reconciliation is lazy and mandatory
-      // before use; branch entries never restore lease authority.
       binding = restoreBinding(ctx.sessionManager.getBranch());
     });
   };
@@ -388,7 +324,6 @@ export function registerSpoolExtension(
   pi.on("session_tree", async (_event, ctx) => {
     await restoreBranchBinding(ctx);
   });
-
   pi.on("session_shutdown", async () => {
     await operationTail;
     const current = service;
@@ -401,102 +336,59 @@ export function registerSpoolExtension(
     identity: RuntimeIdentity,
   ): Promise<Record<string, unknown>> {
     switch (input.action) {
-      case "attach": {
-        const reference = await validateTask(input);
-        const work = await getService().attach(
-          { ...reference, outcome: input.outcome },
-          identity,
-        );
-        persistBinding({
-          version: 1,
-          workId: work.workId,
-          vault: work.vault,
-          taskId: work.taskId,
-          canonicalPath: work.canonicalPath,
-        });
-        return { attached: true, goal: work, acceptance: "not_recorded" };
-      }
-      case "materialize": {
-        const current = await requireBinding();
-        const step = await getService().materialize(current, input);
-        persistBinding({ ...current, stepId: input.stepId });
-        return { materialized: true, ...step };
-      }
-      case "claim": {
-        const current = await requireBinding();
-        const attempt = await getService().claimNext(current, identity, input);
-        if (!attempt) {
+      case "resume": {
+        if (input.taskId) {
           return {
-            claimed: false,
-            reason: "no ready queue item; inspect status and do not assume ownership",
+            ...(await getService().peek({ taskId: input.taskId, vault: input.vault }, identity)),
+            attached: false,
           };
         }
-        if (isClaimUnavailable(attempt)) return { ...attempt };
-        persistBinding({ ...current, stepId: attempt.stepId });
-        return { claimed: true, attempt };
-      }
-      case "report": {
+        if (input.scope === "all" || (!input.canonicalPath && !binding)) {
+          return { ...(await getService().overview(identity)) };
+        }
+        if (input.canonicalPath) {
+          const reference = await readTask({
+            canonicalPath: input.canonicalPath,
+            vault: input.vault,
+          });
+          const work = await getService().attach({
+            vault: reference.vault,
+            taskId: reference.taskId,
+            canonicalPath: reference.canonicalPath,
+            outcome: input.outcome ?? reference.title ?? undefined,
+          });
+          persistBinding({
+            version: 1,
+            workId: work.workId,
+            vault: work.vault,
+            taskId: work.taskId,
+            canonicalPath: work.canonicalPath,
+          });
+        }
         const current = await requireBinding();
-        return {
-          reported: true,
-          report: await getService().report(current, identity, input),
-          ownership: "untracked_execution",
-          accepted: false,
-        };
+        return { ...(await getService().resume(current, identity)) };
       }
-      case "checkpoint": {
+      case "note": {
         const current = await requireBinding();
-        await getService().checkpoint(current, identity, input);
-        return {
-          checkpointed: true,
-          checkpointName: input.checkpointName,
-          evidenceRef: input.evidenceRef,
-          accepted: false,
-        };
+        return { ...(await getService().note(current, identity, input)) };
       }
-      case "heartbeat": {
+      case "done": {
         const current = await requireBinding();
-        const leaseExpiresAt = await getService().heartbeat(
-          current,
-          identity,
-          input.leaseSeconds,
-        );
-        return { renewed: true, leaseExpiresAt };
-      }
-      case "status":
-      case "resume": {
-        const current = await requireBinding();
-        return {
-          mode: input.action,
-          packet: await getService().resume(current, identity),
-        };
-      }
-      case "complete": {
-        const current = await requireBinding();
-        await getService().completeExecution(current, identity, input);
-        return {
-          executionCompleted: true,
-          resultRef: input.resultRef,
-          acceptance: "not_recorded",
-        };
+        return { ...(await getService().done(current, identity, input)) };
       }
     }
   }
 }
 
-export const MAX_TOOL_OUTPUT_BYTES = 16_000;
+export const MAX_TOOL_OUTPUT_BYTES = 8_000;
 
 export function renderSpoolResult(
   action: string,
   result: Record<string, unknown>,
 ): string {
-  const suffix =
-    action === "complete"
-      ? "\nExecution is complete; reviewed acceptance is not recorded."
-      : "";
-  const rendered = `Spool ${action}:\n${JSON.stringify(result)}${suffix}`;
+  const rendered = `Spool ${action}:\n${JSON.stringify(result)}`;
   if (Buffer.byteLength(rendered, "utf8") > MAX_TOOL_OUTPUT_BYTES) {
-    throw new Error("Spool output bound invariant failed; inspect with a narrower query");
+    throw new Error("Spool output bound invariant failed");
   }
   return rendered;
 }

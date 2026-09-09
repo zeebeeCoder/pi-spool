@@ -1,69 +1,56 @@
-export const SPOOL_ACTIONS = [
-  "attach",
-  "materialize",
-  "claim",
-  "report",
-  "checkpoint",
-  "heartbeat",
-  "status",
-  "resume",
-  "complete",
-] as const;
+export const SPOOL_ACTIONS = ["resume", "note", "done"] as const;
 
 export type SpoolAction = (typeof SPOOL_ACTIONS)[number];
 
 export type SpoolToolInput =
   | {
-      action: "attach";
-      vault: string;
-      taskId: string;
-      canonicalPath: string;
-      outcome: string;
+      action: "resume";
+      canonicalPath?: string;
+      vault?: string;
+      outcome?: string;
+      taskId?: string;
+      scope?: "goal" | "all";
     }
   | {
-      action: "materialize";
+      action: "note";
       stepId: string;
-      title: string;
-      contribution: string;
-      criteria: string;
-    }
-  | { action: "claim"; expectedStepId?: string; leaseSeconds: number }
-  | {
-      action: "report";
-      stepId: string;
-      disposition: "in_progress" | "finished";
+      title?: string;
       summary: string;
-      evidenceRef: string;
+      evidenceRef?: string;
       nextAction?: string;
     }
   | {
-      action: "checkpoint";
-      checkpointName: string;
-      evidenceRef: string;
-      nextAction?: string;
-    }
-  | { action: "heartbeat"; leaseSeconds: number }
-  | { action: "status" }
-  | { action: "resume" }
-  | { action: "complete"; resultRef: string; summary: string };
+      action: "done";
+      stepId: string;
+      summary: string;
+      evidenceRef?: string;
+      reviewed?: boolean;
+    };
+
+export const STEP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+export const FIELD_LIMITS = {
+  canonicalPath: 2_000,
+  vault: 100,
+  outcome: 500,
+  taskId: 100,
+  stepId: 100,
+  title: 200,
+  summary: 500,
+  evidenceRef: 1_000,
+  nextAction: 500,
+} as const;
 
 const fieldsByAction: Record<SpoolAction, readonly string[]> = {
-  attach: ["action", "vault", "taskId", "canonicalPath", "outcome"],
-  materialize: ["action", "stepId", "title", "contribution", "criteria"],
-  claim: ["action", "expectedStepId", "leaseSeconds"],
-  report: [
-    "action",
-    "stepId",
-    "disposition",
-    "summary",
-    "evidenceRef",
-    "nextAction",
-  ],
-  checkpoint: ["action", "checkpointName", "evidenceRef", "nextAction"],
-  heartbeat: ["action", "leaseSeconds"],
-  status: ["action"],
-  resume: ["action"],
-  complete: ["action", "resultRef", "summary"],
+  resume: ["action", "canonicalPath", "vault", "outcome", "taskId", "scope"],
+  note: ["action", "stepId", "title", "summary", "evidenceRef", "nextAction"],
+  done: ["action", "stepId", "summary", "evidenceRef", "reviewed"],
+};
+
+const requiredByAction: Record<SpoolAction, readonly string[]> = {
+  resume: [],
+  note: ["stepId", "summary"],
+  done: ["stepId", "summary"],
 };
 
 export function parseSpoolToolInput(value: unknown): SpoolToolInput {
@@ -73,123 +60,45 @@ export function parseSpoolToolInput(value: unknown): SpoolToolInput {
   const input = value as Record<string, unknown>;
   const action = input.action;
   if (typeof action !== "string" || !SPOOL_ACTIONS.includes(action as SpoolAction)) {
-    throw new Error(`unsupported spool action: ${String(action)}`);
+    throw new Error(
+      `unsupported spool action: ${String(action)}; use resume, note, or done`,
+    );
   }
-
-  const typedAction = action as SpoolAction;
-  const allowed = new Set(fieldsByAction[typedAction]);
-  const unexpected = Object.keys(input).find(
-    (key) => input[key] !== undefined && !allowed.has(key),
-  );
-  if (unexpected) {
-    throw new Error(`${typedAction} does not accept ${unexpected}`);
+  const typed = action as SpoolAction;
+  const allowed = new Set(fieldsByAction[typed]);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) {
+      throw new Error(`field ${key} is not accepted by spool action ${typed}`);
+    }
   }
-
-  switch (typedAction) {
-    case "attach":
-      return {
-        action: typedAction,
-        vault: requiredString(input, "vault", 100),
-        taskId: requiredString(input, "taskId", 100),
-        canonicalPath: requiredString(input, "canonicalPath", 2_000),
-        outcome: requiredString(input, "outcome", 500),
-      };
-    case "materialize":
-      return {
-        action: typedAction,
-        stepId: stableId(input, "stepId"),
-        title: requiredString(input, "title", 200),
-        contribution: requiredString(input, "contribution", 500),
-        criteria: requiredString(input, "criteria", 500),
-      };
-    case "claim":
-      return {
-        action: typedAction,
-        expectedStepId: optionalStableId(input, "expectedStepId"),
-        leaseSeconds: leaseSeconds(input, 30),
-      };
-    case "report":
-      return {
-        action: typedAction,
-        stepId: stableId(input, "stepId"),
-        disposition: reportDisposition(input),
-        summary: requiredString(input, "summary", 500),
-        evidenceRef: requiredString(input, "evidenceRef", 1_000),
-        nextAction: optionalString(input, "nextAction", 500),
-      };
-    case "checkpoint":
-      return {
-        action: typedAction,
-        checkpointName: stableId(input, "checkpointName"),
-        evidenceRef: requiredString(input, "evidenceRef", 1_000),
-        nextAction: optionalString(input, "nextAction", 500),
-      };
-    case "heartbeat":
-      return {
-        action: typedAction,
-        leaseSeconds: leaseSeconds(input, 30),
-      };
-    case "status":
-    case "resume":
-      return { action: typedAction };
-    case "complete":
-      return {
-        action: typedAction,
-        resultRef: requiredString(input, "resultRef", 1_000),
-        summary: requiredString(input, "summary", 500),
-      };
+  for (const key of requiredByAction[typed]) {
+    if (input[key] === undefined) {
+      throw new Error(`spool action ${typed} requires ${key}`);
+    }
   }
-}
-
-function reportDisposition(
-  input: Record<string, unknown>,
-): "in_progress" | "finished" {
-  const value = input.disposition;
-  if (value !== "in_progress" && value !== "finished") {
-    throw new Error("disposition must be in_progress or finished");
+  for (const [key, limit] of Object.entries(FIELD_LIMITS)) {
+    const field = input[key];
+    if (field === undefined) continue;
+    if (typeof field !== "string" || field.trim().length === 0) {
+      throw new Error(`${key} must be a non-empty string`);
+    }
+    if (field.length > limit) {
+      throw new Error(`${key} exceeds ${limit} characters`);
+    }
   }
-  return value;
-}
-
-function requiredString(
-  input: Record<string, unknown>,
-  key: string,
-  maxLength: number,
-): string {
-  const value = input[key];
-  if (typeof value !== "string" || value.length === 0 || value.length > maxLength) {
-    throw new Error(`${key} must be a non-empty string up to ${maxLength} characters`);
+  if (input.reviewed !== undefined && typeof input.reviewed !== "boolean") {
+    throw new Error("reviewed must be a boolean");
   }
-  return value;
-}
-
-function optionalString(
-  input: Record<string, unknown>,
-  key: string,
-  maxLength: number,
-): string | undefined {
-  return input[key] === undefined ? undefined : requiredString(input, key, maxLength);
-}
-
-function stableId(input: Record<string, unknown>, key: string): string {
-  const value = requiredString(input, key, 100);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)) {
-    throw new Error(`${key} must be a stable identifier using letters, digits, . _ : or -`);
+  if (input.scope !== undefined && input.scope !== "goal" && input.scope !== "all") {
+    throw new Error("scope must be goal or all");
   }
-  return value;
-}
-
-function optionalStableId(
-  input: Record<string, unknown>,
-  key: string,
-): string | undefined {
-  return input[key] === undefined ? undefined : stableId(input, key);
-}
-
-function leaseSeconds(input: Record<string, unknown>, fallback: number): number {
-  const value = input.leaseSeconds ?? fallback;
-  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > 3_600) {
-    throw new Error("leaseSeconds must be an integer from 1 to 3600");
+  if (input.canonicalPath !== undefined && input.taskId !== undefined) {
+    throw new Error("pass either canonicalPath (attach) or taskId (peek), not both");
   }
-  return value as number;
+  if (typeof input.stepId === "string" && !STEP_ID_PATTERN.test(input.stepId)) {
+    throw new Error(
+      "stepId must start with a letter or digit and contain only letters, digits, ., _, :, or -",
+    );
+  }
+  return input as SpoolToolInput;
 }

@@ -23,36 +23,34 @@ import {
 } from "@earendil-works/pi-tui";
 import {
   DashboardCancelledError,
-  formatDashboardCounts,
-  nextDashboardSort,
+  formatGoalCounts,
+  type DashboardEvent,
   type DashboardGoal,
   type DashboardGoalDetail,
-  type DashboardGoalSnapshot,
-  type DashboardSort,
+  type DashboardSnapshot,
   type DashboardStep,
+  type DashboardStepHistory,
 } from "./dashboard-data.ts";
 import {
   PkmReferenceReader,
   type PkmReferenceReaderLike,
   type PkmTaskReference,
 } from "./pkm-reference.ts";
-import {
-  spoolUserFacingError,
-  type RuntimeIdentity,
-} from "./spool-service.ts";
+import { spoolUserFacingError, type RuntimeIdentity } from "./spool-service.ts";
 
 export interface DashboardReaderLike {
-  readonly queueName: string;
-  loadGoals(
-    sort?: DashboardSort,
-    signal?: AbortSignal,
-  ): Promise<DashboardGoalSnapshot>;
+  loadGoals(signal?: AbortSignal): Promise<DashboardSnapshot>;
   loadGoal(
     goal: DashboardGoal,
     viewer: RuntimeIdentity,
-    sort?: DashboardSort,
     signal?: AbortSignal,
   ): Promise<DashboardGoalDetail>;
+  loadStep(
+    goal: DashboardGoal,
+    step: DashboardStep,
+    viewer: RuntimeIdentity,
+    signal?: AbortSignal,
+  ): Promise<DashboardStepHistory>;
   close(): Promise<void>;
 }
 
@@ -60,40 +58,16 @@ type SelectResult =
   | { action: "select"; value: string }
   | { action: "reference"; value: string }
   | { action: "refresh" }
-  | { action: "sort" }
   | { action: "back" };
-
-interface GoalBrowserSnapshot {
-  dashboard: DashboardGoalSnapshot;
-  references: ReadonlyMap<string, PkmTaskReference>;
-  cache: PkmSnapshotCache;
-}
 
 type LoadResult<T> =
   | { kind: "loaded"; value: T }
   | { kind: "cancelled" }
   | { kind: "error"; error: Error };
 
-class PkmSnapshotCache {
-  private readonly entries = new Map<string, Promise<PkmTaskReference>>();
-  private readonly reader: PkmReferenceReaderLike;
-
-  constructor(reader: PkmReferenceReaderLike) {
-    this.reader = reader;
-  }
-
-  load(
-    canonicalPath: string,
-    expectedTaskId: string,
-    signal?: AbortSignal,
-  ): Promise<PkmTaskReference> {
-    const key = JSON.stringify([canonicalPath, expectedTaskId]);
-    const existing = this.entries.get(key);
-    if (existing) return existing;
-    const pending = this.reader.read(canonicalPath, expectedTaskId, signal);
-    this.entries.set(key, pending);
-    return pending;
-  }
+interface GoalBrowserSnapshot {
+  dashboard: DashboardSnapshot;
+  references: ReadonlyMap<string, PkmTaskReference>;
 }
 
 export async function runSpoolDashboard(
@@ -102,23 +76,15 @@ export async function runSpoolDashboard(
   viewer: RuntimeIdentity,
   pkmReader: PkmReferenceReaderLike = new PkmReferenceReader(),
 ): Promise<void> {
-  let goalSort: DashboardSort = "attention";
   let goals: GoalBrowserSnapshot | undefined;
   while (true) {
     if (!goals) {
-      const loaded = await loadWithUi(
-        ctx,
-        "Loading read-only Spool goals and PKM attribution...",
-        (signal) => loadGoalBrowserSnapshot(reader, pkmReader, goalSort, signal),
+      const loaded = await loadWithUi(ctx, "Loading Spool work log...", (signal) =>
+        loadGoalBrowserSnapshot(reader, pkmReader, signal),
       );
       if (loaded.kind === "cancelled") return;
       if (loaded.kind === "error") {
-        const action = await showError(
-          ctx,
-          reader.queueName,
-          loaded.error,
-          false,
-        );
+        const action = await showError(ctx, loaded.error, false);
         if (action === "refresh") continue;
         return;
       }
@@ -131,111 +97,64 @@ export async function runSpoolDashboard(
       goals = undefined;
       continue;
     }
-    if (goalChoice.action === "sort") {
-      goalSort = nextDashboardSort(goalSort);
-      goals = undefined;
-      continue;
-    }
-    const goal = goals.dashboard.goals.find(
-      (item) => item.key === goalChoice.value,
-    );
+    const goal = goals.dashboard.goals.find((item) => item.workId === goalChoice.value);
     if (!goal) continue;
+    const reference = goals.references.get(goal.workId);
     if (goalChoice.action === "reference") {
-      const reference = goals.references.get(goal.key);
       if (reference) await showPkmReference(ctx, goal, reference);
       continue;
     }
 
-    let stepSort: DashboardSort = "attention";
     let detail: DashboardGoalDetail | undefined;
-    let latestReference = goals.references.get(goal.key);
-    let pkmCache = goals.cache;
     let returnToGoals = false;
     while (!returnToGoals) {
       if (!detail) {
         const loaded = await loadWithUi(
           ctx,
-          `Loading ${goal.vault}/${goal.taskId} workflow...`,
-          async (signal) => {
-            const dashboard = await reader.loadGoal(
-              goal,
-              viewer,
-              stepSort,
-              signal,
-            );
-            const reference = await pkmCache.load(
-              dashboard.goal.latestCanonicalPath,
-              dashboard.goal.taskId,
-              signal,
-            );
-            return { dashboard, reference };
-          },
+          `Loading ${goal.vault}/${goal.taskId}...`,
+          (signal) => reader.loadGoal(goal, viewer, signal),
         );
         if (loaded.kind === "cancelled") {
           returnToGoals = true;
           continue;
         }
         if (loaded.kind === "error") {
-          const action = await showError(
-            ctx,
-            reader.queueName,
-            loaded.error,
-            true,
-          );
+          const action = await showError(ctx, loaded.error, true);
           if (action === "refresh") continue;
           returnToGoals = true;
           continue;
         }
-        detail = loaded.value.dashboard;
-        latestReference = loaded.value.reference;
+        detail = loaded.value;
       }
 
-      const stepChoice = await showStepList(ctx, detail, latestReference);
+      const stepChoice = await showStepList(ctx, detail, reference);
       if (stepChoice.action === "back") {
         returnToGoals = true;
         continue;
       }
       if (stepChoice.action === "refresh") {
-        pkmCache = new PkmSnapshotCache(pkmReader);
         detail = undefined;
         continue;
       }
-      if (stepChoice.action === "sort") {
-        stepSort = nextDashboardSort(stepSort);
-        pkmCache = new PkmSnapshotCache(pkmReader);
-        detail = undefined;
-        continue;
-      }
-      const step = detail.steps.find(
-        (item) => dashboardStepKey(item) === stepChoice.value,
-      );
-      if (!step) continue;
-      const loadedReference = await loadWithUi(
-        ctx,
-        "Loading read-only PKM attribution...",
-        (signal) =>
-          pkmCache.load(step.work.canonicalPath, detail!.goal.taskId, signal),
-      );
-      if (loadedReference.kind === "cancelled") continue;
-      const stepReference =
-        loadedReference.kind === "loaded"
-          ? loadedReference.value
-          : latestReference;
       if (stepChoice.action === "reference") {
-        if (stepReference) await showPkmReference(ctx, detail.goal, stepReference);
+        if (reference) await showPkmReference(ctx, goal, reference);
         continue;
       }
-      const detailChoice = await showStepDetail(
-        ctx,
-        detail,
-        step,
-        stepReference,
+      const step = detail.steps.find((item) => item.stepId === stepChoice.value);
+      if (!step) continue;
+      const history = await loadWithUi(ctx, `Loading ${step.stepId}...`, (signal) =>
+        reader.loadStep(goal, step, viewer, signal),
       );
-      if (detailChoice === "refresh") {
-        pkmCache = new PkmSnapshotCache(pkmReader);
-        detail = undefined;
-      } else if (detailChoice === "reference" && stepReference) {
-        await showPkmReference(ctx, detail.goal, stepReference);
+      if (history.kind === "cancelled") continue;
+      if (history.kind === "error") {
+        const action = await showError(ctx, history.error, true);
+        if (action === "refresh") detail = undefined;
+        continue;
+      }
+      const detailChoice = await showStepDetail(ctx, history.value, reference);
+      if (detailChoice === "refresh") detail = undefined;
+      else if (detailChoice === "reference" && reference) {
+        await showPkmReference(ctx, goal, reference);
       }
     }
   }
@@ -244,58 +163,59 @@ export async function runSpoolDashboard(
 async function loadGoalBrowserSnapshot(
   reader: DashboardReaderLike,
   pkmReader: PkmReferenceReaderLike,
-  sort: DashboardSort,
   signal?: AbortSignal,
 ): Promise<GoalBrowserSnapshot> {
-  const dashboard = await reader.loadGoals(sort, signal);
-  const cache = new PkmSnapshotCache(pkmReader);
+  const dashboard = await reader.loadGoals(signal);
   const loaded = await Promise.all(
-    dashboard.goals.map(async (goal) => [
-      goal.key,
-      await cache.load(goal.latestCanonicalPath, goal.taskId, signal),
-    ] as const),
+    dashboard.goals.map(
+      async (goal) =>
+        [goal.workId, await pkmReader.read(goal.canonicalPath, goal.taskId, signal)] as const,
+    ),
   );
-  return { dashboard, references: new Map(loaded), cache };
+  return { dashboard, references: new Map(loaded) };
+}
+
+export function goalTitle(goal: DashboardGoal, reference?: PkmTaskReference): string {
+  return reference?.status === "available" && reference.title
+    ? safeInline(reference.title)
+    : `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}`;
 }
 
 export function goalSelectItems(
-  snapshot: DashboardGoalSnapshot,
+  snapshot: DashboardSnapshot,
   references: ReadonlyMap<string, PkmTaskReference> = new Map(),
 ): SelectItem[] {
-  return snapshot.goals.map((goal) => {
-    const reference = references.get(goal.key);
-    const label =
-      reference?.status === "available" && reference.title
-        ? safeInline(reference.title)
-        : `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}`;
-    return {
-      value: goal.key,
-      label,
-      description: `${safeInline(goal.vault)}/${safeInline(goal.taskId)} · ${formatDashboardCounts(goal.counts)} · recorded Spool activity ${formatRelativeTime(goal.lastActivityAt, snapshot.snapshotAt)}`,
-    };
-  });
-}
-
-export function stepSelectItems(detail: DashboardGoalDetail): SelectItem[] {
-  const showScope = detail.goal.workCount > 1;
-  return detail.steps.map((step) => ({
-    value: dashboardStepKey(step),
-    label: safeInline(step.title),
-    description: `${formatStepStatus(step)} · recorded Spool activity ${formatRelativeTime(step.lastActivityAt, detail.snapshotAt)}${showScope ? ` · scope ${shortId(step.work.workId)}` : ""}`,
+  return snapshot.goals.map((goal) => ({
+    value: goal.workId,
+    label: goalTitle(goal, references.get(goal.workId)),
+    description: `${safeInline(goal.vault)}/${safeInline(goal.taskId)} · ${formatGoalCounts(goal)} · ${formatRelativeTime(goal.lastActivityAt, snapshot.snapshotAt)}`,
   }));
 }
 
-export function dashboardStepKey(step: DashboardStep): string {
-  return JSON.stringify([step.work.workId, step.stepId]);
+export function stepSelectItems(detail: DashboardGoalDetail): SelectItem[] {
+  return detail.steps.map((step) => ({
+    value: step.stepId,
+    label: safeInline(step.title),
+    description: `${formatStepStatus(step)} · ${formatRelativeTime(step.lastActivityAt, detail.snapshotAt)}`,
+  }));
 }
 
-function humanizeState(state: string): string {
-  return safeInline(state).replaceAll("_", " ").replaceAll("-", " ");
+export function formatStepStatus(step: DashboardStep): string {
+  const who = sessionLabel(step.last);
+  if (step.state === "done") {
+    return `done${step.reviewed ? " · reviewed" : ""} · by ${who}`;
+  }
+  return `open · last ${who}`;
+}
+
+export function sessionLabel(event: DashboardEvent): string {
+  if (event.mine) return "this session";
+  return event.sessionName ? safeInline(event.sessionName) : shortId(event.sessionId);
 }
 
 function shortId(value: string): string {
   const safe = safeInline(value);
-  return safe.length <= 15 ? safe : `${safe.slice(0, 7)}…${safe.slice(-6)}`;
+  return safe.length <= 15 ? safe : `${safe.slice(0, 8)}…`;
 }
 
 export function formatRelativeTime(value: Date, reference: Date): string {
@@ -344,67 +264,37 @@ export function safeBlock(value: string): string {
   return stripTerminalSequences(withoutC1Sequences)
     .replaceAll("\r\n", "\n")
     .replaceAll("\r", "\n")
-    .replace(
-      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g,
-      "",
-    );
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "");
 }
 
 export function safeInline(value: string): string {
   return safeBlock(value).replace(/\s+/g, " ").trim();
 }
 
-function formatPkmAttribution(
-  detail: DashboardGoalDetail,
-  reference?: PkmTaskReference,
-): string {
-  if (reference?.status === "available") {
-    return `${reference.title ? safeInline(reference.title) : `${safeInline(detail.goal.vault)} / ${safeInline(detail.goal.taskId)}`}${reference.project ? ` · project ${safeInline(reference.project)}` : ""} · verified from the recorded canonical task (p opens reference)`;
-  }
-  const notice = reference?.notice ?? "PKM reference was not loaded";
-  return `${safeInline(notice)}. Fallback: ${safeInline(detail.goal.vault)} / ${safeInline(detail.goal.taskId)}. Recorded workflow purpose: ${safeInline(detail.goal.latestOutcome)}`;
-}
-
 export function formatGoalPreview(
   goal: DashboardGoal,
   reference: PkmTaskReference | undefined,
-  snapshot: DashboardGoalSnapshot,
+  snapshot: DashboardSnapshot,
   theme: Theme,
 ): string {
-  const title =
-    reference?.status === "available" && reference.title
-      ? safeInline(reference.title)
-      : `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}`;
   return [
-    theme.fg("accent", theme.bold(title)),
+    theme.fg("accent", theme.bold(goalTitle(goal, reference))),
     theme.fg(
       "muted",
-      `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}${reference?.status === "available" && reference.project ? ` · project ${safeInline(reference.project)}` : ""}${reference?.status === "available" ? " · PKM title from latest recorded work scope" : ""}`,
+      `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}${reference?.status === "available" && reference.project ? ` · project ${safeInline(reference.project)}` : ""}`,
     ),
     "",
-    theme.bold("Recorded workflow purpose"),
-    theme.fg("text", safeBlock(goal.latestOutcome)),
+    theme.bold("Outcome"),
+    theme.fg("text", goal.outcome ? safeBlock(goal.outcome) : "not recorded"),
     "",
-    theme.bold("Tracked execution state"),    stateStyledText(
-      formatDashboardCounts(goal.counts),
-      goal.counts.running > 0 || goal.counts.reportedInProgress > 0
-        ? "running"
-        : goal.counts.ready > 0
-          ? "ready"
-          : "execution_completed",
-      theme,
-    ),
+    theme.fg(goal.openSteps > 0 ? "accent" : "success", formatGoalCounts(goal)),
     theme.fg(
       "muted",
-      `Created ${formatRelativeTime(goal.createdAt, snapshot.snapshotAt)} · last recorded Spool activity ${formatRelativeTime(goal.lastActivityAt, snapshot.snapshotAt)} · snapshot ${formatRelativeTime(snapshot.snapshotAt, new Date())} · manual refresh only`,
-    ),
-    theme.fg(
-      "muted",
-      "Activity outside Spool is not recorded or inferred and remains unknown.",
+      `Created ${formatRelativeTime(goal.createdAt, snapshot.snapshotAt)} · last activity ${formatRelativeTime(goal.lastActivityAt, snapshot.snapshotAt)}`,
     ),
     theme.fg(
       reference?.status === "available" ? "success" : "warning",
-      safeInline(reference?.notice ?? "PKM attribution unavailable"),
+      safeInline(reference?.notice ?? "PKM reference not loaded"),
     ),
   ].join("\n");
 }
@@ -416,92 +306,80 @@ export function formatStepPreview(
 ): string {
   return [
     theme.fg("accent", theme.bold(safeInline(step.title))),
-    stateStyledText(
-      `${formatStepStatus(step)} · created ${formatRelativeTime(step.createdAt, detail.snapshotAt)} · last recorded Spool activity ${formatRelativeTime(step.lastActivityAt, detail.snapshotAt)}`,
-      step.latestAttempt?.leaseStatus === "expired" ? "expired" : step.stepState,
-      theme,
+    theme.fg(
+      step.state === "done" ? "success" : "accent",
+      `${formatStepStatus(step)} · ${step.eventCount} entr${step.eventCount === 1 ? "y" : "ies"} · ${formatRelativeTime(step.lastActivityAt, detail.snapshotAt)}`,
     ),
     "",
-    theme.bold("What this contributes"),
-    theme.fg("text", safeBlock(step.contribution)),
+    theme.bold("Latest"),
+    theme.fg("text", safeBlock(step.last.summary)),
     "",
-    theme.bold("Useful next action"),
+    theme.bold("Next action"),
     theme.fg(
-      step.latestAttempt?.nextAction ? "text" : "muted",
-      step.report?.nextAction
-        ? safeBlock(step.report.nextAction)
-        : step.latestAttempt?.nextAction
-          ? safeBlock(step.latestAttempt.nextAction)
-          : step.report
-            ? "No next action was included in the attributed report."
-            : step.latestAttempt
-              ? "No next action recorded."
-              : "No tracked attempt in Spool; activity outside Spool is unknown.",
+      step.last.nextAction ? "text" : "muted",
+      step.last.nextAction ? safeBlock(step.last.nextAction) : "none recorded",
     ),
   ].join("\n");
 }
 
-function stateStyledText(
-  text: string,
-  state: string,
-  theme: Theme,
-): string {
-  if (state === "expired") return theme.fg("error", text);
-  if (state === "ready") return theme.fg("warning", text);
-  if (state === "execution_completed" || state === "reported_finished_untracked") {
-    return theme.fg("success", text);
-  }
-  return theme.fg("accent", text);
+export function formatEventLine(event: DashboardEvent, reference: Date): string {
+  const head = `${event.kind === "done" ? "done" : "note"}${event.kind === "done" && event.reviewed ? " (reviewed)" : ""} · ${sessionLabel(event)} · ${formatRelativeTime(event.recordedAt, reference)}`;
+  const lines = [head, `  ${safeInline(event.summary)}`];
+  if (event.evidenceRef) lines.push(`  evidence: ${safeInline(event.evidenceRef)}`);
+  if (event.nextAction) lines.push(`  next: ${safeInline(event.nextAction)}`);
+  return lines.join("\n");
 }
 
-function styleStepDetail(
-  text: string,
-  step: DashboardStep,
-  theme: Theme,
+export function formatStepDetailText(
+  history: DashboardStepHistory,
+  reference?: PkmTaskReference,
 ): string {
-  const headings = new Set([
-    "What this contributes",
-    "Completion criteria",
-    "Activity",
-    "Latest checkpoint",
-    "Attributed report",
-    "Execution record",
-    "PKM attribution",
-    "Technical details",
-  ]);
-  let technical = false;
+  const { step, goal } = history;
+  const lines = [
+    safeInline(step.title),
+    `${formatStepStatus(step)} · ${formatRelativeTime(step.lastActivityAt, history.snapshotAt)}`,
+    "",
+    "History",
+  ];
+  if (history.events.length === 0) lines.push("No entries recorded.");
+  for (const event of history.events) {
+    lines.push(formatEventLine(event, history.snapshotAt), "");
+  }
+  if (history.omittedEvents > 0) {
+    lines.push(
+      `${history.omittedEvents} older entr${history.omittedEvents === 1 ? "y" : "ies"} not shown.`,
+      "",
+    );
+  }
+  lines.push(
+    "Goal",
+    `${goalTitle(goal, reference)} · ${safeInline(goal.vault)} / ${safeInline(goal.taskId)}`,
+    "",
+    "Details",
+    `Step ID: ${safeInline(step.stepId)}`,
+    `Created: ${formatExactLocalTime(step.createdAt)}`,
+    `Task file: ${safeInline(goal.canonicalPath)}`,
+    `Snapshot: ${formatExactLocalTime(history.snapshotAt)} (read-only)`,
+  );
+  return lines.join("\n");
+}
+
+function styleStepDetail(text: string, theme: Theme): string {
+  const headings = new Set(["History", "Goal", "Details"]);
+  let details = false;
   return text
     .split("\n")
     .map((line, index) => {
       if (index === 0) return theme.fg("accent", theme.bold(line));
-      if (index === 1) {
-        return stateStyledText(
-          line,
-          step.latestAttempt?.leaseStatus === "expired"
-            ? "expired"
-            : step.stepState,
-          theme,
-        );
-      }
+      if (index === 1) return theme.fg(line.startsWith("done") ? "success" : "accent", line);
       if (headings.has(line)) {
-        if (line === "Technical details") technical = true;
+        details = line === "Details";
         return theme.fg("accent", theme.bold(line));
       }
-      if (line.startsWith("Execution is complete.")) {
-        return theme.fg("success", line);
-      }
-      if (line.includes("lease expired") || line.includes("not current ownership")) {
-        return theme.fg("error", line);
-      }
-      if (line.startsWith("Review / acceptance")) {
-        return theme.fg("warning", line);
-      }
-      if (
-        technical ||
-        line.startsWith("Last recorded Spool activity:") ||
-        line.startsWith("Activity outside Spool") ||
-        line.startsWith("Recorded ")
-      ) {
+      if (details) return theme.fg("muted", line);
+      if (line.startsWith("done")) return theme.fg("success", line);
+      if (line.startsWith("note")) return theme.fg("accent", line);
+      if (line.startsWith("  evidence:") || line.startsWith("  next:")) {
         return theme.fg("muted", line);
       }
       return theme.fg("text", line);
@@ -509,163 +387,15 @@ function styleStepDetail(
     .join("\n");
 }
 
-export function formatStepStatus(step: DashboardStep): string {
-  if (step.report) {
-    const reporter = step.report.reporterPiSessionName ?? shortId(step.report.reporterPiSessionId);
-    return `reported ${humanizeState(step.report.disposition)} · untracked execution · reporter ${reporter}`;
-  }
-  const state = `${humanizeState(step.stepState)} in Spool`;
-  const attempt = step.latestAttempt;
-  if (!attempt) return `${state} · no tracked attempt`;
-  const owner = attempt.piSessionName ?? shortId(attempt.piSessionId);
-  if (attempt.attemptState === "active" && attempt.leaseStatus === "expired") {
-    return `${state} · expired lease · last owner ${owner}`;
-  }
-  if (attempt.isCurrentRuntimeOwner) return `${state} · owned here`;
-  if (attempt.attemptState === "active" && attempt.leaseStatus === "valid") {
-    return `${state} · owner ${owner}`;
-  }
-  return `${state} · last owner ${owner}`;
-}
-
-export function formatStepDetailText(
-  detail: DashboardGoalDetail,
-  step: DashboardStep,
-  options: {
-    reference?: PkmTaskReference;
-    technical?: boolean;
-  } = {},
-): string {
-  const attempt = step.latestAttempt;
-  const checkpoint = step.checkpoint;
-  const completion = step.completion;
-  const ownership = step.report
-    ? `Attributed report from ${safeInline(step.report.reporterPiSessionName ?? step.report.reporterPiSessionId)}; execution is untracked and no lease ownership is claimed.`
-    : !attempt
-      ? "No tracked attempt is recorded in Spool. Activity outside Spool is not recorded or inferred and remains unknown."
-    : attempt.isCurrentRuntimeOwner
-      ? `Owned by this Pi runtime (${safeInline(attempt.piSessionName ?? attempt.piSessionId)}).`
-      : attempt.attemptState === "active" && attempt.leaseStatus === "expired"
-        ? `The latest attempt from ${safeInline(attempt.piSessionName ?? attempt.piSessionId)} is recorded active, but its lease expired; it is not current ownership.`
-        : attempt.attemptState === "active" && attempt.leaseStatus === "valid"
-          ? `Owned by ${safeInline(attempt.piSessionName ?? attempt.piSessionId)} with a valid lease.`
-          : `Last worked by ${safeInline(attempt.piSessionName ?? attempt.piSessionId)}; no current lease ownership is recorded.`;
-  const lines = [
-    safeInline(step.title),
-    `${formatStepStatus(step)} · last recorded Spool activity ${formatRelativeTime(step.lastActivityAt, detail.snapshotAt)}`,
-    "",
-    "What this contributes",
-    safeBlock(step.contribution),
-    "",
-    "Completion criteria",
-    safeBlock(step.criteria),
-    "",
-    "Activity",
-    ownership,
-  ];
-  if (attempt) {
-    lines.push(
-      `Latest transition: ${humanizeState(attempt.lastTransition)}${attempt.lastSummary ? ` — ${safeInline(attempt.lastSummary)}` : ""}`,
-      `Latest recorded attempt next action: ${attempt.nextAction ? safeInline(attempt.nextAction) : "none recorded"}`,
-      `Last recorded Spool activity: ${formatRelativeTime(attempt.lastActivityAt, detail.snapshotAt)}. This may include a lease heartbeat; it is not time spent.`,
-      "Activity outside Spool is not recorded or inferred and remains unknown.",
-    );
-  }
-  if (step.report) {
-    lines.push(
-      "",
-      "Attributed report",
-      `${humanizeState(step.report.disposition)} · untracked execution`,
-      safeBlock(step.report.summary),
-      `Evidence: ${safeInline(step.report.evidenceRef)}`,
-      `Reported ${formatRelativeTime(step.report.reportedAt, detail.snapshotAt)} by ${safeInline(step.report.reporterPiSessionName ?? step.report.reporterPiSessionId)}`,
-      `Next action: ${step.report.nextAction ? safeInline(step.report.nextAction) : "none reported"}`,
-      "Reporter-attributed status; not lease ownership, verified truth, or acceptance.",
-    );
-  }
-  if (checkpoint) {
-    lines.push(
-      "",
-      "Latest checkpoint",
-      safeInline(checkpoint.name),
-      `Evidence: ${checkpoint.evidenceRef ? safeInline(checkpoint.evidenceRef) : "none recorded"}`,
-      checkpoint.recordedAt
-        ? `Recorded ${formatRelativeTime(new Date(checkpoint.recordedAt), detail.snapshotAt)}`
-        : "Checkpoint time not recorded",
-    );
-  }
-  if (completion) {
-    lines.push(
-      "",
-      "Execution record",
-      completion.summary ? safeBlock(completion.summary) : "Execution summary not recorded.",
-      `Result reference: ${completion.resultRef ? safeInline(completion.resultRef) : "none recorded"}`,
-      "Execution is complete. Review / acceptance is not recorded.",
-    );
-  } else {
-    lines.push("", "Review / acceptance is not recorded.");
-  }
-  lines.push("", "PKM attribution", formatPkmAttribution(detail, options.reference));
-  if (detail.omittedSteps > 0) {
-    lines.push(
-      "",
-      `${detail.omittedSteps} of ${detail.totalSteps} step(s) are omitted from this bounded view.`,
-    );
-  }
-  if (detail.goal.omittedScopes > 0) {
-    lines.push(
-      `${detail.goal.omittedScopes} work scope(s) are omitted; this step retains its exact work identity.`,
-    );
-  }
-  if (options.technical) {
-    lines.push(
-      "",
-      "Technical details",
-      `Queue: ${safeInline(detail.queueName)}`,
-      `Snapshot: ${formatExactLocalTime(detail.snapshotAt)} (read-only)`,
-      `Vault / task: ${safeInline(detail.goal.vault)} / ${safeInline(detail.goal.taskId)}`,
-      `Step ID: ${safeInline(step.stepId)}`,
-      `Work ID: ${safeInline(step.work.workId)}`,
-      `Absurd task state: ${step.taskState ? safeInline(step.taskState) : "not available"}`,
-      `Step created: ${formatExactLocalTime(step.createdAt)}`,
-      `Last recorded Spool activity: ${formatExactLocalTime(step.lastActivityAt)}`,
-      `Recorded outcome: ${safeBlock(step.work.outcome)}`,
-      `Canonical path: ${safeInline(step.work.canonicalPath)}`,
-    );
-    if (attempt) {
-      lines.push(
-        `Attempt: ${attempt.attempt} · ${safeInline(attempt.attemptState)}`,
-        `Session ID: ${safeInline(attempt.piSessionId)}`,
-        `Claimed: ${formatExactLocalTime(attempt.claimedAt)}`,
-        `Attempt activity: ${formatExactLocalTime(attempt.lastActivityAt)}`,
-        `Lease: ${safeInline(attempt.leaseStatus)} · expires ${formatExactLocalTime(attempt.leaseExpiresAt)}`,
-      );
-    }
-  }
-  return lines.join("\n");
-}
-
-export function selectFooterLines(
-  width: number,
-  sort: DashboardSort | undefined,
-  allowReference: boolean,
-): string[] {
+export function selectFooterLines(width: number, allowReference: boolean): string[] {
   const safeWidth = Math.max(1, Math.floor(width));
   const raw =
     safeWidth >= 64
       ? [
           "↑/↓ select · Enter open · PgUp/PgDn preview",
-          `${sort ? `s sort:${sort} · ` : ""}${allowReference ? "p PKM · " : ""}r refresh · Esc back`,
+          `${allowReference ? "p PKM · " : ""}r refresh · Esc back`,
         ]
-      : safeWidth >= 32
-        ? [
-            "↑↓/Enter select · Pg preview",
-            `${sort ? "s sort · " : ""}${allowReference ? "p PKM · " : ""}r reload · Esc back`,
-          ]
-        : [
-            "↑↓/Enter · Pg preview",
-            `${sort ? "s sort · " : ""}${allowReference ? "p PKM · " : ""}r · Esc`,
-          ];
+      : ["↑↓/Enter · Pg preview", `${allowReference ? "p PKM · " : ""}r · Esc`];
   return raw.map((line) => truncateToWidth(line, safeWidth, ""));
 }
 
@@ -677,8 +407,7 @@ export function createSelectScreen(options: {
   previewLabel?: string;
   preview?: (value: string) => string;
   emptyMessage: string;
-  disclosure: string;
-  sort?: DashboardSort;
+  disclosure?: string;
   allowReference?: boolean;
   theme: Theme;
   terminalRows?: () => number;
@@ -697,9 +426,7 @@ export function createSelectScreen(options: {
     overscroll: "contain",
     scrollbar: "hidden",
   });
-  const border = new DynamicBorder((text: string) =>
-    options.theme.fg("borderAccent", text),
-  );
+  const border = new DynamicBorder((text: string) => options.theme.fg("borderAccent", text));
   let selectedValue = list.getSelectedItem()?.value;
   const updatePreview = (value?: string): void => {
     selectedValue = value;
@@ -708,8 +435,7 @@ export function createSelectScreen(options: {
   };
   updatePreview(selectedValue);
   if (options.items.length > 0) {
-    list.onSelect = (item) =>
-      options.onDone({ action: "select", value: item.value });
+    list.onSelect = (item) => options.onDone({ action: "select", value: item.value });
     list.onCancel = () => options.onDone({ action: "back" });
     list.onSelectionChange = (item) => updatePreview(item.value);
   }
@@ -725,11 +451,7 @@ export function createSelectScreen(options: {
         options.theme.fg("accent", options.theme.bold(safeInline(options.title))),
         safeWidth,
       );
-      const context = new Text(
-        options.theme.fg("muted", safeBlock(options.context)),
-        0,
-        0,
-      )
+      const context = new Text(options.theme.fg("muted", safeBlock(options.context)), 0, 0)
         .render(safeWidth)
         .slice(0, decorated ? 2 : 0);
       const navigationLabel = decorated
@@ -737,9 +459,7 @@ export function createSelectScreen(options: {
             truncateToWidth(
               options.theme.fg(
                 "muted",
-                options.theme.bold(
-                  `${safeInline(options.navigationLabel ?? "Tracked navigation")}${options.sort ? ` · sort ${options.sort}` : ""}`,
-                ),
+                options.theme.bold(safeInline(options.navigationLabel ?? "Navigation")),
               ),
               safeWidth,
             ),
@@ -748,25 +468,18 @@ export function createSelectScreen(options: {
       const listLines =
         options.items.length > 0
           ? list.render(safeWidth)
-          : new Text(
-              options.theme.fg("warning", safeInline(options.emptyMessage)),
-              0,
-              0,
-            ).render(safeWidth);
-      const disclosure = decorated
-        ? new Text(
-            options.theme.fg("warning", safeBlock(options.disclosure)),
-            0,
-            0,
-          )
-            .render(safeWidth)
-            .slice(0, 2)
-        : [];
-      const footer = selectFooterLines(
-        safeWidth,
-        options.sort,
-        options.allowReference ?? false,
-      ).map((line) => options.theme.fg("customMessageText", line));
+          : new Text(options.theme.fg("warning", safeInline(options.emptyMessage)), 0, 0).render(
+              safeWidth,
+            );
+      const disclosure =
+        decorated && options.disclosure
+          ? new Text(options.theme.fg("warning", safeBlock(options.disclosure)), 0, 0)
+              .render(safeWidth)
+              .slice(0, 2)
+          : [];
+      const footer = selectFooterLines(safeWidth, options.allowReference ?? false).map((line) =>
+        options.theme.fg("customMessageText", line),
+      );
       const chrome = [
         ...(decorated ? border.render(safeWidth) : []),
         title,
@@ -774,11 +487,7 @@ export function createSelectScreen(options: {
         ...navigationLabel,
         ...listLines,
       ];
-      const tail = [
-        ...disclosure,
-        ...footer,
-        ...(decorated ? border.render(safeWidth) : []),
-      ];
+      const tail = [...disclosure, ...footer, ...(decorated ? border.render(safeWidth) : [])];
       const availablePreviewRows = Math.max(
         0,
         Number.isFinite(panelHeight)
@@ -792,30 +501,18 @@ export function createSelectScreen(options: {
               truncateToWidth(
                 options.theme.fg(
                   "accent",
-                  options.theme.bold(
-                    safeInline(options.previewLabel ?? "Selected preview"),
-                  ),
+                  options.theme.bold(safeInline(options.previewLabel ?? "Selected")),
                 ),
                 safeWidth,
               ),
             ]
           : [];
-      const previewHeight = Math.max(
-        0,
-        availablePreviewRows - previewChrome.length,
-      );
+      const previewHeight = Math.max(0, availablePreviewRows - previewChrome.length);
       const previewContent = previewScroll.render(safeWidth);
-      previewScroll.updateLayout(
-        previewContent.length,
-        previewHeight,
-        options.requestRender,
-      );
+      previewScroll.updateLayout(previewContent.length, previewHeight, options.requestRender);
       const preview =
         previewHeight > 0
-          ? previewContent.slice(
-              previewScroll.scrollTop,
-              previewScroll.scrollTop + previewHeight,
-            )
+          ? previewContent.slice(previewScroll.scrollTop, previewScroll.scrollTop + previewHeight)
           : [];
       while (preview.length < previewHeight) preview.push("");
       return [...chrome, ...previewChrome, ...preview, ...tail];
@@ -829,9 +526,7 @@ export function createSelectScreen(options: {
     },
     handleInput(data) {
       if (data === "r") options.onDone({ action: "refresh" });
-      else if (data === "s" && options.sort) {
-        options.onDone({ action: "sort" });
-      } else if (data === "p" && options.allowReference && selectedValue) {
+      else if (data === "p" && options.allowReference && selectedValue) {
         options.onDone({ action: "reference", value: selectedValue });
       } else if (matchesKey(data, Key.pageUp)) {
         previewScroll.scrollBy(-Math.max(1, previewScroll.viewportHeight - 1));
@@ -839,10 +534,7 @@ export function createSelectScreen(options: {
         previewScroll.scrollBy(Math.max(1, previewScroll.viewportHeight - 1));
       } else if (options.items.length > 0) {
         list.handleInput(data);
-      } else if (
-        matchesKey(data, Key.escape) ||
-        matchesKey(data, Key.ctrl("c"))
-      ) {
+      } else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
         options.onDone({ action: "back" });
       }
       options.requestRender();
@@ -854,19 +546,16 @@ export const SPOOL_MODAL_HEIGHT_RATIO = 0.85;
 export const SPOOL_MODAL_VERTICAL_PADDING = 2;
 export const MAX_DETAIL_PANEL_ROWS = 27;
 
-export interface StepDetailScreen extends Component {
+export interface ScrollScreen extends Component {
   readonly scrollTop: number;
   readonly viewportHeight: number;
 }
 
 export function modalContentRows(terminalRows: number): number {
-  const safeRows = Number.isFinite(terminalRows)
-    ? Math.max(0, Math.floor(terminalRows))
-    : 0;
+  const safeRows = Number.isFinite(terminalRows) ? Math.max(0, Math.floor(terminalRows)) : 0;
   return Math.max(
     3,
-    Math.floor(safeRows * SPOOL_MODAL_HEIGHT_RATIO) -
-      SPOOL_MODAL_VERTICAL_PADDING,
+    Math.floor(safeRows * SPOOL_MODAL_HEIGHT_RATIO) - SPOOL_MODAL_VERTICAL_PADDING,
   );
 }
 
@@ -874,42 +563,26 @@ export function detailPanelRows(terminalRows: number): number {
   return Math.min(MAX_DETAIL_PANEL_ROWS, modalContentRows(terminalRows));
 }
 
-export function createStepDetailScreen(options: {
-  detail: DashboardGoalDetail;
-  step: DashboardStep;
-  reference?: PkmTaskReference;
+/** A bordered, scrollable text panel used for step history and PKM reference. */
+export function createScrollScreen(options: {
+  heading: string;
+  text: () => string;
+  extraHints?: string;
   theme: Theme;
   terminalRows: () => number;
   onDone: (result: "back" | "refresh" | "reference") => void;
   requestRender: () => void;
-}): StepDetailScreen {
+  allowReference?: boolean;
+}): ScrollScreen {
   const body = new Text("", 1, 0);
-  let technical = false;
-  const updateBody = (): void => {
-    body.setText(
-      styleStepDetail(
-        formatStepDetailText(options.detail, options.step, {
-          reference: options.reference,
-          technical,
-        }),
-        options.step,
-        options.theme,
-      ),
-    );
-  };
+  const updateBody = (): void => body.setText(options.text());
   updateBody();
   const scroll = new ScrollView(body, {
     primary: true,
     overscroll: "contain",
     scrollbar: "hidden",
   });
-  const topBorder = new DynamicBorder((text: string) =>
-    options.theme.fg("accent", text),
-  );
-  const bottomBorder = new DynamicBorder((text: string) =>
-    options.theme.fg("accent", text),
-  );
-
+  const border = new DynamicBorder((text: string) => options.theme.fg("accent", text));
   return {
     get scrollTop() {
       return scroll.scrollTop;
@@ -921,20 +594,11 @@ export function createStepDetailScreen(options: {
       const safeWidth = Math.max(1, Math.floor(width));
       const panelHeight = detailPanelRows(options.terminalRows());
       const decorated = panelHeight >= 6;
-      const header = decorated
-        ? [
-            ...topBorder.render(safeWidth),
-            truncateToWidth(
-              options.theme.fg("accent", options.theme.bold("Workflow step")),
-              safeWidth,
-            ),
-          ]
-        : [
-            truncateToWidth(
-              options.theme.fg("accent", options.theme.bold("Workflow step")),
-              safeWidth,
-            ),
-          ];
+      const heading = truncateToWidth(
+        options.theme.fg("accent", options.theme.bold(options.heading)),
+        safeWidth,
+      );
+      const header = decorated ? [...border.render(safeWidth), heading] : [heading];
       const footerHeight = decorated ? 2 : 1;
       const bodyHeight = Math.max(1, panelHeight - header.length - footerHeight);
       const content = scroll.render(safeWidth);
@@ -946,32 +610,24 @@ export function createStepDetailScreen(options: {
       const status = truncateToWidth(
         options.theme.fg(
           "dim",
-          `Rows ${content.length === 0 ? 0 : start + 1}–${end}/${content.length} · ↑↓ scroll · i ${technical ? "hide" : "show"} technical · p PKM · r refresh · ${keyHint("tui.select.cancel", "back")}`,
+          `Rows ${content.length === 0 ? 0 : start + 1}–${end}/${content.length} · ↑↓ scroll${options.extraHints ? ` · ${options.extraHints}` : ""} · ${keyHint("tui.select.cancel", "back")}`,
         ),
         safeWidth,
       );
       return decorated
-        ? [...header, ...visible, status, ...bottomBorder.render(safeWidth)]
+        ? [...header, ...visible, status, ...border.render(safeWidth)]
         : [...header, ...visible, status];
     },
     invalidate() {
       body.invalidate();
       scroll.invalidate();
-      topBorder.invalidate();
-      bottomBorder.invalidate();
+      border.invalidate();
       updateBody();
     },
     handleInput(data) {
       if (data === "r") options.onDone("refresh");
-      else if (data === "p") options.onDone("reference");
-      else if (data === "i") {
-        technical = !technical;
-        updateBody();
-        scroll.scrollToStart();
-      } else if (
-        matchesKey(data, Key.escape) ||
-        matchesKey(data, Key.ctrl("c"))
-      ) {
+      else if (data === "p" && options.allowReference) options.onDone("reference");
+      else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
         options.onDone("back");
       } else if (matchesKey(data, Key.home)) scroll.scrollToStart();
       else if (matchesKey(data, Key.end)) scroll.scrollToEnd();
@@ -984,6 +640,27 @@ export function createStepDetailScreen(options: {
       options.requestRender();
     },
   };
+}
+
+export function createStepDetailScreen(options: {
+  history: DashboardStepHistory;
+  reference?: PkmTaskReference;
+  theme: Theme;
+  terminalRows: () => number;
+  onDone: (result: "back" | "refresh" | "reference") => void;
+  requestRender: () => void;
+}): ScrollScreen {
+  return createScrollScreen({
+    heading: "Step",
+    text: () =>
+      styleStepDetail(formatStepDetailText(options.history, options.reference), options.theme),
+    extraHints: "p PKM · r refresh",
+    allowReference: true,
+    theme: options.theme,
+    terminalRows: options.terminalRows,
+    onDone: options.onDone,
+    requestRender: options.requestRender,
+  });
 }
 
 export function spoolOverlayOptions(terminalColumns: number): OverlayOptions {
@@ -999,11 +676,7 @@ export function spoolOverlayOptions(terminalColumns: number): OverlayOptions {
   };
 }
 
-export function renderModalSurfaceLine(
-  line: string,
-  width: number,
-  theme: Theme,
-): string {
+export function renderModalSurfaceLine(line: string, width: number, theme: Theme): string {
   const safeWidth = Math.max(1, Math.floor(width));
   const padding = safeWidth >= 5 ? 2 : 0;
   const innerWidth = Math.max(1, safeWidth - padding * 2);
@@ -1013,14 +686,10 @@ export function renderModalSurfaceLine(
     /\u001b\[([0-9;]*)m/g,
     (sequence, parameters: string) => {
       const codes = parameters === "" ? [0] : parameters.split(";").map(Number);
-      return codes.includes(0) || codes.includes(49)
-        ? `${sequence}${background}`
-        : sequence;
+      return codes.includes(0) || codes.includes(49) ? `${sequence}${background}` : sequence;
     },
   );
-  const right = " ".repeat(
-    Math.max(0, innerWidth - visibleWidth(withContinuousBackground)),
-  );
+  const right = " ".repeat(Math.max(0, innerWidth - visibleWidth(withContinuousBackground)));
   return theme.bg(
     "customMessageBg",
     `${" ".repeat(padding)}${withContinuousBackground}${right}${" ".repeat(padding)}`,
@@ -1070,8 +739,7 @@ async function showModal<T>(
     },
     {
       overlay: true,
-      overlayOptions: () =>
-        spoolOverlayOptions(liveTui?.terminal?.columns ?? 120),
+      overlayOptions: () => spoolOverlayOptions(liveTui?.terminal?.columns ?? 120),
     },
   );
 }
@@ -1083,28 +751,22 @@ async function showGoalList(
   const snapshot = browser.dashboard;
   return await showModal(ctx, (tui, theme, done) =>
     createSelectScreen({
-      title: "Spool workflows",
-      context: `${safeInline(snapshot.queueName)} · ${snapshot.totalGoals} goal(s) · snapshot ${formatRelativeTime(snapshot.snapshotAt, new Date())} · read-only`,
+      title: "Spool work log",
+      context: `${snapshot.totalGoals} goal(s) · snapshot ${formatRelativeTime(snapshot.snapshotAt, new Date())}`,
       items: goalSelectItems(snapshot, browser.references),
-      navigationLabel: "Tracked workflows",
-      previewLabel: "Selected workflow",
+      navigationLabel: "Goals",
+      previewLabel: "Selected goal",
       preview: (value) => {
-        const goal = snapshot.goals.find((item) => item.key === value);
+        const goal = snapshot.goals.find((item) => item.workId === value);
         return goal
-          ? formatGoalPreview(
-              goal,
-              browser.references.get(value),
-              snapshot,
-              theme,
-            )
+          ? formatGoalPreview(goal, browser.references.get(value), snapshot, theme)
           : "";
       },
-      emptyMessage: "No recorded Spool workflows in this configured queue.",
+      emptyMessage: "No goals recorded yet.",
       disclosure:
         snapshot.omittedGoals > 0
-          ? `${snapshot.omittedGoals} goal(s) omitted by the 50-goal display bound. Review / acceptance is not recorded.`
-          : "Review / acceptance is not recorded.",
-      sort: snapshot.sort,
+          ? `${snapshot.omittedGoals} goal(s) beyond the ${snapshot.goals.length}-goal window are not shown.`
+          : undefined,
       allowReference: true,
       theme,
       terminalRows: () => tui.terminal.rows,
@@ -1119,30 +781,22 @@ async function showStepList(
   detail: DashboardGoalDetail,
   reference?: PkmTaskReference,
 ): Promise<SelectResult> {
-  const scopeDisclosure =
-    detail.goal.workCount > 1
-      ? `${detail.goal.workCount} distinct work scopes share this vault/task ID; each step retains its exact scope. `
-      : "";
-  const title =
-    reference?.status === "available" && reference.title
-      ? reference.title
-      : `${detail.goal.vault} / ${detail.goal.taskId}`;
   return await showModal(ctx, (tui, theme, done) =>
     createSelectScreen({
-      title: safeInline(title),
-      context: `${safeInline(detail.goal.vault)} / ${safeInline(detail.goal.taskId)} · ${formatDashboardCounts(detail.goal.counts)} · snapshot ${formatRelativeTime(detail.snapshotAt, new Date())}`,
+      title: goalTitle(detail.goal, reference),
+      context: `${safeInline(detail.goal.vault)} / ${safeInline(detail.goal.taskId)} · ${formatGoalCounts(detail.goal)} · snapshot ${formatRelativeTime(detail.snapshotAt, new Date())}`,
       items: stepSelectItems(detail),
-      navigationLabel: "Tracked steps",
+      navigationLabel: "Steps",
       previewLabel: "Selected step",
       preview: (value) => {
-        const step = detail.steps.find(
-          (item) => dashboardStepKey(item) === value,
-        );
+        const step = detail.steps.find((item) => item.stepId === value);
         return step ? formatStepPreview(step, detail, theme) : "";
       },
-      emptyMessage: "This recorded workflow has no materialized steps.",
-      disclosure: `${scopeDisclosure}${detail.omittedSteps > 0 ? `${detail.omittedSteps} step(s) omitted by the 50-step display bound. ` : ""}Review / acceptance is not recorded.`,
-      sort: detail.sort,
+      emptyMessage: "No steps recorded for this goal.",
+      disclosure:
+        detail.omittedSteps > 0
+          ? `${detail.omittedSteps} step(s) beyond the ${detail.steps.length}-step window are not shown.`
+          : undefined,
       allowReference: true,
       theme,
       terminalRows: () => tui.terminal.rows,
@@ -1154,14 +808,12 @@ async function showStepList(
 
 async function showStepDetail(
   ctx: ExtensionCommandContext,
-  detail: DashboardGoalDetail,
-  step: DashboardStep,
+  history: DashboardStepHistory,
   reference?: PkmTaskReference,
 ): Promise<"back" | "refresh" | "reference"> {
   return await showModal(ctx, (tui, theme, done) =>
     createStepDetailScreen({
-      detail,
-      step,
+      history,
       reference,
       theme,
       terminalRows: () => tui.terminal.rows,
@@ -1171,16 +823,9 @@ async function showStepDetail(
   );
 }
 
-export function formatPkmReferenceText(
-  goal: DashboardGoal,
-  reference: PkmTaskReference,
-): string {
-  const title =
-    reference.status === "available" && reference.title
-      ? safeInline(reference.title)
-      : `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}`;
+export function formatPkmReferenceText(goal: DashboardGoal, reference: PkmTaskReference): string {
   const lines = [
-    title,
+    goalTitle(goal, reference),
     `${safeInline(goal.vault)} / ${safeInline(goal.taskId)}${reference.status === "available" && reference.project ? ` · project ${safeInline(reference.project)}` : ""}`,
     "",
     "Reference status",
@@ -1188,17 +833,16 @@ export function formatPkmReferenceText(
     "",
   ];
   if (reference.status === "available" && reference.goalText) {
-    lines.push("Canonical PKM goal", safeBlock(reference.goalText), "");
+    lines.push("PKM goal", safeBlock(reference.goalText), "");
   }
   lines.push(
-    "Recorded Spool purpose",
-    safeBlock(goal.latestOutcome),
+    "Recorded outcome",
+    goal.outcome ? safeBlock(goal.outcome) : "not recorded",
     "",
-    "Attribution details",
-    `Canonical path: ${safeInline(reference.canonicalPath)}`,
+    "Details",
+    `Task file: ${safeInline(reference.canonicalPath)}`,
     `Expected task ID: ${safeInline(reference.expectedTaskId)}`,
     `File task ID: ${reference.fileTaskId ? safeInline(reference.fileTaskId) : "not available"}`,
-    "Read-only reference; no file or task state was changed.",
   );
   return lines.join("\n");
 }
@@ -1210,113 +854,33 @@ export function createPkmReferenceScreen(options: {
   terminalRows: () => number;
   onDone: () => void;
   requestRender: () => void;
-}): StepDetailScreen {
-  const body = new Text("", 1, 0);
-  const updateBody = (): void => {
-    body.setText(
+}): ScrollScreen {
+  const headings = new Set(["Reference status", "PKM goal", "Recorded outcome", "Details"]);
+  return createScrollScreen({
+    heading: "PKM reference",
+    text: () =>
       formatPkmReferenceText(options.goal, options.reference)
         .split("\n")
         .map((line, index) => {
-          if (index === 0) {
-            return options.theme.fg("accent", options.theme.bold(line));
-          }
-          if (
-            line === "Reference status" ||
-            line === "Canonical PKM goal" ||
-            line === "Recorded Spool purpose" ||
-            line === "Attribution details"
-          ) {
-            return options.theme.fg("accent", options.theme.bold(line));
-          }
+          if (index === 0) return options.theme.fg("accent", options.theme.bold(line));
+          if (headings.has(line)) return options.theme.fg("accent", options.theme.bold(line));
           if (line === safeInline(options.reference.notice)) {
             return options.theme.fg(
-              options.reference.status === "available"
-                ? "success"
-                : "warning",
+              options.reference.status === "available" ? "success" : "warning",
               line,
             );
           }
-          if (
-            line.startsWith("Canonical path:") ||
-            line.startsWith("Expected task ID:") ||
-            line.startsWith("File task ID:") ||
-            line.startsWith("Read-only reference")
-          ) {
+          if (/^(Task file|Expected task ID|File task ID):/.test(line)) {
             return options.theme.fg("muted", line);
           }
           return options.theme.fg("text", line);
         })
         .join("\n"),
-    );
-  };
-  updateBody();
-  const scroll = new ScrollView(body, {
-    primary: true,
-    overscroll: "contain",
-    scrollbar: "hidden",
+    theme: options.theme,
+    terminalRows: options.terminalRows,
+    onDone: () => options.onDone(),
+    requestRender: options.requestRender,
   });
-  const border = new DynamicBorder((text: string) =>
-    options.theme.fg("borderAccent", text),
-  );
-  return {
-    get scrollTop() {
-      return scroll.scrollTop;
-    },
-    get viewportHeight() {
-      return scroll.viewportHeight;
-    },
-    render(width) {
-      const safeWidth = Math.max(1, Math.floor(width));
-      const panelHeight = detailPanelRows(options.terminalRows());
-      const decorated = panelHeight >= 6;
-      const header = decorated
-        ? [
-            ...border.render(safeWidth),
-            truncateToWidth(
-              options.theme.fg("accent", options.theme.bold("PKM reference")),
-              safeWidth,
-            ),
-          ]
-        : [truncateToWidth("PKM reference", safeWidth)];
-      const footerHeight = decorated ? 2 : 1;
-      const bodyHeight = Math.max(1, panelHeight - header.length - footerHeight);
-      const content = scroll.render(safeWidth);
-      scroll.updateLayout(content.length, bodyHeight, options.requestRender);
-      const start = scroll.scrollTop;
-      const visible = content.slice(start, start + bodyHeight);
-      while (visible.length < bodyHeight) visible.push("");
-      const end = Math.min(start + bodyHeight, content.length);
-      const status = truncateToWidth(
-        options.theme.fg(
-          "dim",
-          `Rows ${content.length === 0 ? 0 : start + 1}–${end}/${content.length} · ↑↓ scroll · ${keyHint("tui.select.cancel", "back")}`,
-        ),
-        safeWidth,
-      );
-      return decorated
-        ? [...header, ...visible, status, ...border.render(safeWidth)]
-        : [...header, ...visible, status];
-    },
-    invalidate() {
-      body.invalidate();
-      scroll.invalidate();
-      border.invalidate();
-      updateBody();
-    },
-    handleInput(data) {
-      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-        options.onDone();
-      } else if (matchesKey(data, Key.home)) scroll.scrollToStart();
-      else if (matchesKey(data, Key.end)) scroll.scrollToEnd();
-      else if (matchesKey(data, Key.pageUp)) {
-        scroll.scrollBy(-Math.max(1, scroll.viewportHeight - 1));
-      } else if (matchesKey(data, Key.pageDown)) {
-        scroll.scrollBy(Math.max(1, scroll.viewportHeight - 1));
-      } else if (matchesKey(data, Key.up)) scroll.scrollBy(-1);
-      else if (matchesKey(data, Key.down)) scroll.scrollBy(1);
-      options.requestRender();
-    },
-  };
 }
 
 async function showPkmReference(
@@ -1337,64 +901,39 @@ async function showPkmReference(
 }
 
 export function createErrorScreen(options: {
-  queueName: string;
   error: Error;
   backToGoals: boolean;
   theme: Theme;
   onDone: (result: "refresh" | "back") => void;
   requestRender: () => void;
 }): Component {
-  const safe = spoolUserFacingError(options.error);
-  const message = safeInline(safe.message);
-  const boundedMessage =
-    message.length <= 1_000
-      ? message
-      : `${message.slice(0, 1_000)}… [error text truncated]`;
+  const message = safeInline(spoolUserFacingError(options.error).message);
+  const bounded = message.length <= 1_000 ? message : `${message.slice(0, 1_000)}… [truncated]`;
   return {
     render(width) {
       const container = new Container();
+      container.addChild(new DynamicBorder((text: string) => options.theme.fg("error", text)));
       container.addChild(
-        new DynamicBorder((text: string) => options.theme.fg("error", text)),
+        new Text(options.theme.fg("error", options.theme.bold("Spool unavailable")), 1, 0),
       );
-      container.addChild(
-        new Text(
-          options.theme.fg(
-            "error",
-            options.theme.bold("Spool snapshot unavailable"),
-          ),
-          1,
-          0,
-        ),
-      );
-      container.addChild(
-        new Text(
-          `${options.theme.fg("muted", `Queue: ${safeInline(options.queueName)}`)}\n${options.theme.fg("text", boundedMessage)}`,
-          1,
-          1,
-        ),
-      );
+      container.addChild(new Text(options.theme.fg("text", bounded), 1, 1));
       container.addChild(
         new Text(
           options.theme.fg(
             "dim",
-            `r retry once · ${keyHint("tui.select.cancel", options.backToGoals ? "back to goals" : "close")}`,
+            `r retry · ${keyHint("tui.select.cancel", options.backToGoals ? "back to goals" : "close")}`,
           ),
           1,
           0,
         ),
       );
-      container.addChild(
-        new DynamicBorder((text: string) => options.theme.fg("error", text)),
-      );
+      container.addChild(new DynamicBorder((text: string) => options.theme.fg("error", text)));
       return container.render(width);
     },
     invalidate() {},
     handleInput: (data) => {
       if (data === "r") options.onDone("refresh");
-      else if (
-        matchesKey(data, Key.escape) ||
-        matchesKey(data, Key.ctrl("c"))
-      ) {
+      else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
         options.onDone("back");
       }
       options.requestRender();
@@ -1404,13 +943,11 @@ export function createErrorScreen(options: {
 
 async function showError(
   ctx: ExtensionCommandContext,
-  queueName: string,
   error: Error,
   backToGoals: boolean,
 ): Promise<"refresh" | "back"> {
   return await showModal(ctx, (tui, theme, done) =>
     createErrorScreen({
-      queueName,
       error,
       backToGoals,
       theme,
@@ -1443,10 +980,7 @@ async function loadWithUi<T>(
         }
         finish({
           kind: "error",
-          error:
-            error instanceof Error
-              ? error
-              : new Error("Unknown dashboard error"),
+          error: error instanceof Error ? error : new Error("Unknown dashboard error"),
         });
       },
     );

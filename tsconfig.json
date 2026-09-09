@@ -3,14 +3,22 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "strict": true,
     "erasableSyntaxOnly": true,
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "bin/**/*.ts"
+  ]
 }

@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve, sep } from "node:path";
 
 export const SPOOL_BINDING_ENTRY = "spool-binding";
 
@@ -9,7 +9,6 @@ export interface SessionBinding {
   vault: string;
   taskId: string;
   canonicalPath: string;
-  stepId?: string;
 }
 
 interface SessionEntryLike {
@@ -18,6 +17,7 @@ interface SessionEntryLike {
   data?: unknown;
 }
 
+/** Restores the latest binding stored on the current session branch. */
 export function restoreBinding(entries: readonly SessionEntryLike[]): SessionBinding | null {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
@@ -37,16 +37,26 @@ export function isSessionBinding(value: unknown): value is SessionBinding {
     isNonEmpty(binding.workId) &&
     isNonEmpty(binding.vault) &&
     isNonEmpty(binding.taskId) &&
-    isNonEmpty(binding.canonicalPath) &&
-    (binding.stepId === undefined || isNonEmpty(binding.stepId))
+    isNonEmpty(binding.canonicalPath)
   );
 }
 
-export async function validateCanonicalTaskReference(input: {
+export interface CanonicalTaskReference {
   vault: string;
   taskId: string;
   canonicalPath: string;
-}): Promise<{ vault: string; taskId: string; canonicalPath: string }> {
+  title: string | null;
+}
+
+/**
+ * Reads a PKM task file and derives the goal reference from it: the task ID
+ * comes from frontmatter `id`, the vault from an explicit argument or the
+ * `vaults/<name>/` path segment, and the title from frontmatter `title`.
+ */
+export async function readCanonicalTaskReference(input: {
+  canonicalPath: string;
+  vault?: string;
+}): Promise<CanonicalTaskReference> {
   if (!isAbsolute(input.canonicalPath)) {
     throw new Error("canonicalPath must be absolute");
   }
@@ -56,13 +66,25 @@ export async function validateCanonicalTaskReference(input: {
   if (!frontmatter) {
     throw new Error("canonical task file must start with YAML frontmatter");
   }
-  const id = frontmatter[1]?.match(/^id:\s*["']?([^\s"']+)["']?\s*$/m)?.[1];
-  if (id !== input.taskId) {
+  const taskId = frontmatter[1]?.match(/^id:\s*["']?([^\s"']+)["']?\s*$/m)?.[1];
+  if (!taskId) {
+    throw new Error("canonical task frontmatter has no id");
+  }
+  const title = frontmatter[1]?.match(/^title:\s*["']?(.+?)["']?\s*$/m)?.[1] ?? null;
+  const vault = input.vault ?? vaultFromPath(canonicalPath);
+  if (!vault) {
     throw new Error(
-      `canonical task ID mismatch: expected ${input.taskId}, found ${id ?? "none"}`,
+      "vault could not be derived from the path; pass vault explicitly",
     );
   }
-  return { ...input, canonicalPath };
+  return { vault, taskId, canonicalPath, title };
+}
+
+export function vaultFromPath(path: string): string | null {
+  const parts = path.split(sep);
+  const index = parts.lastIndexOf("vaults");
+  const vault = index >= 0 ? parts[index + 1] : undefined;
+  return vault && vault.length > 0 ? vault : null;
 }
 
 function isNonEmpty(value: unknown): value is string {

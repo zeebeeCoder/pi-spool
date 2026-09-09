@@ -13,13 +13,24 @@ import {
   type SessionBinding,
 } from "./binding.ts";
 import { readSpoolConfig, type SpoolConfig } from "./config.ts";
+import { SpoolDashboardReader } from "./dashboard-data.ts";
+import {
+  runSpoolDashboard,
+  type DashboardReaderLike,
+} from "./dashboard-ui.ts";
+import {
+  PkmReferenceReader,
+  type PkmReferenceReaderLike,
+} from "./pkm-reference.ts";
 import {
   SpoolService,
+  isClaimUnavailable,
   spoolUserFacingError,
-  type ClaimedAttempt,
+  type ClaimNextResult,
   type ResumePacket,
   type RuntimeIdentity,
   type StepDefinition,
+  type StepReport,
   type WorkRecord,
 } from "./spool-service.ts";
 import {
@@ -34,7 +45,7 @@ export const spoolParameters = Type.Object(
   {
     action: StringEnum([...SPOOL_ACTIONS], {
       description:
-        "Operation and field map: attach requires vault, taskId, canonicalPath, outcome; materialize requires stepId, title, contribution, criteria; claim allows expectedStepId and leaseSeconds; checkpoint requires checkpointName and evidenceRef and allows nextAction; heartbeat allows leaseSeconds; status/resume accept no other fields; complete requires resultRef and summary (not outcome).",
+        "Operation and field map: attach requires vault, taskId, canonicalPath, outcome; materialize requires stepId, title, contribution, criteria; claim allows expectedStepId and leaseSeconds; report requires stepId, disposition, summary, evidenceRef and allows nextAction; checkpoint requires checkpointName and evidenceRef and allows nextAction; heartbeat allows leaseSeconds; status/resume accept no other fields; complete requires resultRef and summary (not outcome).",
     }),
     vault: Type.Optional(
       Type.String({
@@ -71,7 +82,7 @@ export const spoolParameters = Type.Object(
         maxLength: 100,
         pattern: stableIdentifierPattern,
         description:
-          "Materialize only (required): max 100 characters; start alphanumeric, then letters, digits, ., _, :, or -.",
+          "Materialize or report (required): max 100 characters; start alphanumeric, then letters, digits, ., _, :, or -.",
       }),
     ),
     title: Type.Optional(
@@ -111,6 +122,11 @@ export const spoolParameters = Type.Object(
         description: "Optional for claim or heartbeat; rejected otherwise.",
       }),
     ),
+    disposition: Type.Optional(
+      StringEnum(["in_progress", "finished"], {
+        description: "Report only (required): in_progress or finished.",
+      }),
+    ),
     checkpointName: Type.Optional(
       Type.String({
         minLength: 1,
@@ -124,14 +140,14 @@ export const spoolParameters = Type.Object(
       Type.String({
         minLength: 1,
         maxLength: 1_000,
-        description: "Checkpoint only (required): non-empty, max 1000 characters.",
+        description: "Checkpoint or report (required): non-empty, max 1000 characters.",
       }),
     ),
     nextAction: Type.Optional(
       Type.String({
         minLength: 1,
         maxLength: 500,
-        description: "Checkpoint only (optional): non-empty, max 500 characters.",
+        description: "Checkpoint or report (optional): non-empty, max 500 characters.",
       }),
     ),
     resultRef: Type.Optional(
@@ -146,7 +162,7 @@ export const spoolParameters = Type.Object(
         minLength: 1,
         maxLength: 500,
         description:
-          "Complete only (required execution summary): non-empty, max 500 characters.",
+          "Report or complete (required): non-empty, max 500 characters.",
       }),
     ),
   },
@@ -172,7 +188,18 @@ export interface SpoolServiceLike {
     binding: SessionBinding,
     identity: RuntimeIdentity,
     options: { expectedStepId?: string; leaseSeconds: number },
-  ): Promise<ClaimedAttempt | null>;
+  ): Promise<ClaimNextResult>;
+  report(
+    binding: SessionBinding,
+    identity: RuntimeIdentity,
+    input: {
+      stepId: string;
+      disposition: "in_progress" | "finished";
+      summary: string;
+      evidenceRef: string;
+      nextAction?: string;
+    },
+  ): Promise<StepReport>;
   checkpoint(
     binding: SessionBinding,
     identity: RuntimeIdentity,
@@ -197,6 +224,8 @@ export interface SpoolExtensionDependencies {
   agentDir?: string;
   runtimeId?: string;
   createService?: (config: SpoolConfig) => SpoolServiceLike;
+  createDashboardReader?: (config: SpoolConfig) => DashboardReaderLike;
+  createPkmReferenceReader?: () => PkmReferenceReaderLike;
   validateTaskReference?: typeof validateCanonicalTaskReference;
 }
 
@@ -212,6 +241,15 @@ export function extractRuntimeIdentity(
     runtimeId,
   };
 }
+
+export const SPOOL_PROMPT_GUIDELINES = [
+  "Use spool only for consequential work that a later turn/session depends on, a durable wait, or an effect expensive to repeat; do not record private reasoning, routine tool calls, or micro-steps.",
+  "Spool records optional continuity. It authorizes mutations only to its owned execution record; user or coordinator authorization—not a Spool claim—authorizes coding, peer work, or external effects.",
+  "Use report only for an explicitly identified materialized step already underway or finished outside lease ownership. It is attributed, untracked, unverified status—not an attempt or acceptance—and its first safe write withdraws only that step's still-pending task; ownership or withdrawal uncertainty is a hard error.",
+  "Begin Spool tracking by attaching the explicit canonical goal. Before attempt-bound mutations, inspect durable state and claim the expected queue head. Fail closed on a real same-step owner, lost lease, storage failure, or uncertain external effect/commit.",
+  "A typed claim result with claimed:false, tracking:unavailable, reason:queue_head_mismatch, and rollback:confirmed acquires no ownership. Follow its nextAction once: unless strict tracking was explicitly required, continue otherwise authorized work through normal ownership/coordination untracked. Never loop claims, sweep, reorder, or take unrelated work merely to satisfy Spool; ownership, lease, admission, storage, and uncertain-effect failures remain hard errors.",
+  "Spool execution completion is not reviewed evidence acceptance; explain that distinction when reporting results.",
+] as const;
 
 export function registerSpoolExtension(
   pi: ExtensionAPI,
@@ -265,18 +303,53 @@ export function registerSpoolExtension(
     pi.appendEntry(SPOOL_BINDING_ENTRY, next);
   };
 
+  pi.registerCommand("spool", {
+    description: "Browse a read-only snapshot of the configured Spool queue",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        const message = "/spool requires interactive Pi TUI mode";
+        if (ctx.hasUI) {
+          ctx.ui.notify(message, "error");
+          return;
+        }
+        throw new Error(message);
+      }
+
+      let reader: DashboardReaderLike | undefined;
+      try {
+        const config = readSpoolConfig(
+          dependencies.env ?? process.env,
+          dependencies.agentDir ?? getAgentDir(),
+        );
+        reader = dependencies.createDashboardReader
+          ? dependencies.createDashboardReader(config)
+          : SpoolDashboardReader.connect(config);
+        await runSpoolDashboard(
+          ctx,
+          reader,
+          extractRuntimeIdentity(ctx, pi, runtimeId),
+          dependencies.createPkmReferenceReader?.() ?? new PkmReferenceReader(),
+        );
+      } catch (error) {
+        ctx.ui.notify(spoolUserFacingError(error).message, "error");
+      } finally {
+        if (reader) {
+          await reader.close().catch((error: unknown) => {
+            ctx.ui.notify(spoolUserFacingError(error).message, "error");
+          });
+        }
+      }
+    },
+  });
+
   pi.registerTool({
     name: "spool",
     label: "Spool",
     description:
-      "Attach a canonical PKM goal and durably materialize, claim, checkpoint, inspect, resume, heartbeat, or execution-complete one consequential step. Fields are action-specific: complete requires summary and resultRef, never outcome. Checkpoints are not reviewed acceptance.",
+      "Optionally record continuity for one consequential step: attach, materialize, claim, report attributed untracked progress, checkpoint, inspect, resume, heartbeat, or execution-complete. A Spool claim authorizes only its owned execution record, not the underlying user-approved work. Fields are action-specific: complete requires summary and resultRef, never outcome. Reports and checkpoints are not reviewed acceptance.",
     promptSnippet:
       "Durably attach and continue consequential work across Pi sessions",
-    promptGuidelines: [
-      "Use spool only for consequential work that a later turn/session depends on, a durable wait, or an effect expensive to repeat; do not record private reasoning, routine tool calls, or micro-steps.",
-      "Before spool mutations, attach the explicit canonical goal, inspect durable state, claim within current ownership, and stop on lost ownership, storage failure, or uncertain external side effects.",
-      "Spool execution completion is not reviewed evidence acceptance; explain that distinction when reporting results.",
-    ],
+    promptGuidelines: [...SPOOL_PROMPT_GUIDELINES],
     parameters: spoolParameters,
     async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("spool operation cancelled");
@@ -358,8 +431,18 @@ export function registerSpoolExtension(
             reason: "no ready queue item; inspect status and do not assume ownership",
           };
         }
+        if (isClaimUnavailable(attempt)) return { ...attempt };
         persistBinding({ ...current, stepId: attempt.stepId });
         return { claimed: true, attempt };
+      }
+      case "report": {
+        const current = await requireBinding();
+        return {
+          reported: true,
+          report: await getService().report(current, identity, input),
+          ownership: "untracked_execution",
+          accepted: false,
+        };
       }
       case "checkpoint": {
         const current = await requireBinding();

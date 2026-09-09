@@ -2,6 +2,7 @@ export const SPOOL_ACTIONS = [
   "attach",
   "materialize",
   "claim",
+  "report",
   "checkpoint",
   "heartbeat",
   "status",
@@ -28,6 +29,14 @@ export type SpoolToolInput =
     }
   | { action: "claim"; expectedStepId?: string; leaseSeconds: number }
   | {
+      action: "report";
+      stepId: string;
+      disposition: "in_progress" | "finished";
+      summary: string;
+      evidenceRef: string;
+      nextAction?: string;
+    }
+  | {
       action: "checkpoint";
       checkpointName: string;
       evidenceRef: string;
@@ -42,6 +51,14 @@ const fieldsByAction: Record<SpoolAction, readonly string[]> = {
   attach: ["action", "vault", "taskId", "canonicalPath", "outcome"],
   materialize: ["action", "stepId", "title", "contribution", "criteria"],
   claim: ["action", "expectedStepId", "leaseSeconds"],
+  report: [
+    "action",
+    "stepId",
+    "disposition",
+    "summary",
+    "evidenceRef",
+    "nextAction",
+  ],
   checkpoint: ["action", "checkpointName", "evidenceRef", "nextAction"],
   heartbeat: ["action", "leaseSeconds"],
   status: ["action"],
@@ -91,6 +108,15 @@ export function parseSpoolToolInput(value: unknown): SpoolToolInput {
         expectedStepId: optionalStableId(input, "expectedStepId"),
         leaseSeconds: leaseSeconds(input, 30),
       };
+    case "report":
+      return {
+        action: typedAction,
+        stepId: stableId(input, "stepId"),
+        disposition: reportDisposition(input),
+        summary: requiredString(input, "summary", 500),
+        evidenceRef: requiredString(input, "evidenceRef", 1_000),
+        nextAction: optionalString(input, "nextAction", 500),
+      };
     case "checkpoint":
       return {
         action: typedAction,
@@ -113,6 +139,16 @@ export function parseSpoolToolInput(value: unknown): SpoolToolInput {
         summary: requiredString(input, "summary", 500),
       };
   }
+}
+
+function reportDisposition(
+  input: Record<string, unknown>,
+): "in_progress" | "finished" {
+  const value = input.disposition;
+  if (value !== "in_progress" && value !== "finished") {
+    throw new Error("disposition must be in_progress or finished");
+  }
+  return value;
 }
 
 function requiredString(

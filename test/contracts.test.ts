@@ -12,7 +12,10 @@ import {
   getSpoolConfigPath,
   readSpoolConfig,
 } from "../src/config.ts";
-import { spoolParameters } from "../src/index.ts";
+import {
+  SPOOL_PROMPT_GUIDELINES,
+  spoolParameters,
+} from "../src/index.ts";
 import { parseSpoolToolInput } from "../src/tool-contract.ts";
 
 test("tool action validation is strict and action-specific", () => {
@@ -25,6 +28,24 @@ test("tool action validation is strict and action-specific", () => {
       action: "claim",
       expectedStepId: "verify-recovery",
       leaseSeconds: 30,
+    },
+  );
+  assert.deepEqual(
+    parseSpoolToolInput({
+      action: "report",
+      stepId: "report-step",
+      disposition: "in_progress",
+      summary: "Work is underway without a lease",
+      evidenceRef: "git:working-tree",
+      nextAction: "Finish tests",
+    }),
+    {
+      action: "report",
+      stepId: "report-step",
+      disposition: "in_progress",
+      summary: "Work is underway without a lease",
+      evidenceRef: "git:working-tree",
+      nextAction: "Finish tests",
     },
   );
   assert.deepEqual(
@@ -60,6 +81,29 @@ test("tool action validation is strict and action-specific", () => {
   assert.throws(
     () => parseSpoolToolInput({ action: "heartbeat", leaseSeconds: 0 }),
     /leaseSeconds/,
+  );
+  assert.throws(
+    () =>
+      parseSpoolToolInput({
+        action: "report",
+        stepId: "report-step",
+        disposition: "complete",
+        summary: "wrong disposition",
+        evidenceRef: "none",
+      }),
+    /disposition must be in_progress or finished/,
+  );
+  assert.throws(
+    () =>
+      parseSpoolToolInput({
+        action: "report",
+        stepId: "report-step",
+        disposition: "finished",
+        summary: "done",
+        evidenceRef: "test:pass",
+        leaseSeconds: 30,
+      }),
+    /report does not accept leaseSeconds/,
   );
 });
 
@@ -132,6 +176,21 @@ test("advertised field constraints match strict complete boundaries", () => {
       }),
     /resultRef must be a non-empty string up to 1000 characters/,
   );
+});
+
+test("prompt contract separates optional tracking from work authorization", () => {
+  const guidance = SPOOL_PROMPT_GUIDELINES.join("\n");
+  assert.match(guidance, /user or coordinator authorization.*authorizes coding/);
+  assert.match(
+    guidance,
+    /claimed:false, tracking:unavailable, reason:queue_head_mismatch, and rollback:confirmed/,
+  );
+  assert.match(guidance, /Follow its nextAction once/);
+  assert.match(guidance, /continue otherwise authorized work.*untracked/);
+  assert.match(guidance, /unless strict tracking was explicitly required/);
+  assert.match(guidance, /Never loop claims, sweep, reorder/);
+  assert.match(guidance, /real same-step owner, lost lease.*uncertain external effect\/commit/);
+  assert.match(guidance, /ownership, lease, admission, storage.*remain hard errors/);
 });
 
 test("binding restoration selects the latest valid custom entry", () => {

@@ -46,6 +46,46 @@ export interface ClaimedAttempt {
   leaseExpiresAt: Date;
 }
 
+export interface StepReport {
+  stepId: string;
+  disposition: "in_progress" | "finished";
+  summary: string;
+  evidenceRef: string;
+  nextAction: string | null;
+  reporterPiSessionId: string;
+  reporterPiSessionName: string | null;
+  reporterRuntimeId: string;
+  reportedAt: Date;
+  execution: "untracked";
+  acceptance: "not_recorded";
+}
+
+export interface ClaimUnavailable {
+  claimed: false;
+  tracking: "unavailable";
+  reason: "queue_head_mismatch";
+  rollback: "confirmed";
+  intended: {
+    workId: string;
+    stepId: string;
+    taskId: string;
+  };
+  head: {
+    workId: string;
+    stepId: string;
+    taskId: string;
+  };
+  nextAction: string;
+}
+
+export type ClaimNextResult = ClaimedAttempt | ClaimUnavailable | null;
+
+export function isClaimUnavailable(
+  result: Exclude<ClaimNextResult, null>,
+): result is ClaimUnavailable {
+  return "claimed" in result && result.claimed === false;
+}
+
 export interface ResumePacket {
   goal: {
     workId: string;
@@ -60,6 +100,8 @@ export interface ResumePacket {
     contribution: string;
     criteria: string;
     state: string;
+    trackedState?: string;
+    report?: StepReport | null;
     latestAttempt: null | {
       attemptId: string;
       attempt: number;
@@ -97,6 +139,16 @@ export class ClaimConflictError extends Error {
   }
 }
 
+class QueueHeadMismatchRollback extends Error {
+  readonly result: ClaimUnavailable;
+
+  constructor(result: ClaimUnavailable) {
+    super("Roll back the unrelated queue-head claim");
+    this.name = "QueueHeadMismatchRollback";
+    this.result = result;
+  }
+}
+
 export class LostOwnershipError extends Error {
   constructor(message: string) {
     super(message);
@@ -109,6 +161,30 @@ export class SpoolDatabaseError extends Error {
     super(message);
     this.name = "SpoolDatabaseError";
   }
+}
+
+export function createBoundedSpoolPool(databaseUrl: string): Pool {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    max: 4,
+    connectionTimeoutMillis: SPOOL_CONNECTION_TIMEOUT_MS,
+    statement_timeout: SPOOL_STATEMENT_TIMEOUT_MS,
+    query_timeout: SPOOL_QUERY_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: SPOOL_STATEMENT_TIMEOUT_MS,
+    idleTimeoutMillis: SPOOL_STATEMENT_TIMEOUT_MS,
+  });
+  // pg emits idle-client failures as EventEmitter errors. Keep Docker loss
+  // from crashing Pi; the next explicit operation reports the sanitized error.
+  pool.on("error", () => undefined);
+  return pool;
+}
+
+export async function closeBoundedSpoolPool(pool: Pool): Promise<void> {
+  await withDeadline(
+    pool.end(),
+    SPOOL_CLOSE_TIMEOUT_MS,
+    "Timed out closing the Spool database pool; process exit will release remaining sockets",
+  );
 }
 
 export class SpoolService {
@@ -130,31 +206,18 @@ export class SpoolService {
   }
 
   static connect(config: SpoolConfig): SpoolService {
-    const pool = new Pool({
-      connectionString: config.databaseUrl,
-      max: 4,
-      connectionTimeoutMillis: SPOOL_CONNECTION_TIMEOUT_MS,
-      statement_timeout: SPOOL_STATEMENT_TIMEOUT_MS,
-      query_timeout: SPOOL_QUERY_TIMEOUT_MS,
-      idle_in_transaction_session_timeout: SPOOL_STATEMENT_TIMEOUT_MS,
-      idleTimeoutMillis: SPOOL_STATEMENT_TIMEOUT_MS,
-    });
-    // pg emits idle-client failures as EventEmitter errors. Keep Docker loss
-    // from crashing Pi; the next explicit Spool action reports the bounded,
-    // sanitized connection failure instead.
-    pool.on("error", () => undefined);
-    return new SpoolService(pool, config.queueName, true);
+    return new SpoolService(
+      createBoundedSpoolPool(config.databaseUrl),
+      config.queueName,
+      true,
+    );
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     if (!this.ownsPool) return;
-    await withDeadline(
-      this.pool.end(),
-      SPOOL_CLOSE_TIMEOUT_MS,
-      "Timed out closing the Spool database pool; process exit will release remaining sockets",
-    );
+    await closeBoundedSpoolPool(this.pool);
   }
 
   async attach(
@@ -308,8 +371,8 @@ export class SpoolService {
     binding: SessionBinding,
     identity: RuntimeIdentity,
     options: { expectedStepId?: string; leaseSeconds: number },
-  ): Promise<ClaimedAttempt | null> {
-    return await this.transaction(async (client) => {
+  ): Promise<ClaimNextResult> {
+    const operation = this.transaction(async (client) => {
       await this.requireWork(client, binding);
       const current = await client.query<{
         attempt_id: string;
@@ -364,15 +427,63 @@ export class SpoolService {
         claimed.task_name !== TASK_NAME ||
         jsonString(params, "kind") !== TASK_NAME ||
         workId === null ||
-        stepId === null ||
+        stepId === null
+      ) {
+        throw new ClaimConflictError(
+          `queue head ${claimed.task_id}/${stepId ?? "unknown"} is not a valid admitted Spool task; claim rolled back`,
+        );
+      }
+      if (
         workId !== binding.workId ||
         (options.expectedStepId !== undefined && stepId !== options.expectedStepId)
       ) {
-        throw new ClaimConflictError(
-          `queue head ${claimed.task_id}/${stepId ?? "unknown"} does not match attached work${
-            options.expectedStepId ? ` step ${options.expectedStepId}` : ""
-          }; claim rolled back`,
+        const expectedStepId = options.expectedStepId;
+        if (!expectedStepId) {
+          throw new ClaimConflictError(
+            `queue head ${claimed.task_id}/${stepId} does not match attached work and no explicit intended step was supplied; claim rolled back`,
+          );
+        }
+        const head = await this.lockStep(
+          client,
+          workId,
+          stepId,
+          new ClaimConflictError(
+            `queue head ${claimed.task_id} is not admitted as ${workId}/${stepId}; claim rolled back`,
+          ),
         );
+        if (
+          head.queue_name !== this.queueName ||
+          head.absurd_task_id !== claimed.task_id
+        ) {
+          throw new ClaimConflictError(
+            `queue head ${claimed.task_id} is not the admitted task for ${workId}/${stepId}; claim rolled back`,
+          );
+        }
+        const intended = await this.requireSafeMismatchFallback(
+          client,
+          txSdk,
+          binding,
+          expectedStepId,
+          current.rows.some((attempt) => !attempt.lease_valid),
+        );
+        throw new QueueHeadMismatchRollback({
+          claimed: false,
+          tracking: "unavailable",
+          reason: "queue_head_mismatch",
+          rollback: "confirmed",
+          intended: {
+            workId: binding.workId,
+            stepId: expectedStepId,
+            taskId: intended.absurdTaskId,
+          },
+          head: {
+            workId,
+            stepId,
+            taskId: claimed.task_id,
+          },
+          nextAction:
+            "Optional Spool tracking is unavailable because another admitted queue item is ahead. Continue otherwise authorized work untracked through normal coordination, or pause and ask if strict tracking is required. Do not retry, sweep, reorder, cancel, or claim the unrelated head.",
+        });
       }
 
       const step = await this.lockStep(client, workId, stepId);
@@ -453,6 +564,135 @@ export class SpoolService {
         leaseExpiresAt,
       };
     });
+    try {
+      return await operation;
+    } catch (error) {
+      if (error instanceof QueueHeadMismatchRollback) return error.result;
+      throw error;
+    }
+  }
+
+  async report(
+    binding: SessionBinding,
+    identity: RuntimeIdentity,
+    input: {
+      stepId: string;
+      disposition: "in_progress" | "finished";
+      summary: string;
+      evidenceRef: string;
+      nextAction?: string;
+    },
+  ): Promise<StepReport> {
+    return await this.transaction(async (client) => {
+      await this.requireWork(client, binding);
+      const step = await this.lockStep(client, binding.workId, input.stepId);
+      const active = await client.query<{ lease_valid: boolean }>(
+        `SELECT lease_expires_at > absurd.current_time() AS lease_valid
+           FROM spool.attempts
+          WHERE work_id = $1 AND step_id = $2 AND state = 'active'
+          FOR UPDATE`,
+        [binding.workId, input.stepId],
+      );
+      if (active.rows.some((attempt) => attempt.lease_valid)) {
+        throw new LostOwnershipError(
+          `step ${input.stepId} has a valid leased owner; use owned checkpoint/complete instead of report`,
+        );
+      }
+      if (active.rows.length > 0) {
+        throw new LostOwnershipError(
+          `step ${input.stepId} has an unresolved expired attempt; inspect ownership before reporting`,
+        );
+      }
+
+      const existing = await client.query(
+        `SELECT 1 FROM spool.step_reports
+          WHERE work_id = $1 AND step_id = $2
+          FOR UPDATE`,
+        [binding.workId, input.stepId],
+      );
+      if (!existing.rowCount) {
+        if (step.state !== "ready" || !step.absurd_task_id) {
+          throw new ClaimConflictError(
+            `step ${input.stepId} is not an unclaimed admitted ready step; report refused`,
+          );
+        }
+        const sdk = this.sdk.bindToConnection(client);
+        const before = await sdk.fetchTaskResult(step.absurd_task_id, {
+          queue: this.queueName,
+        });
+        if (!before || before.state !== "pending") {
+          throw new ClaimConflictError(
+            `step ${input.stepId} is not durably pending; report withdrawal is unsafe`,
+          );
+        }
+        await sdk.cancelTask(step.absurd_task_id, this.queueName);
+        const after = await sdk.fetchTaskResult(step.absurd_task_id, {
+          queue: this.queueName,
+        });
+        if (!after || after.state !== "cancelled") {
+          throw new ClaimConflictError(
+            `step ${input.stepId} queue withdrawal could not be confirmed`,
+          );
+        }
+      }
+
+      const result = await client.query<{
+        disposition: "in_progress" | "finished";
+        summary: string;
+        evidence_ref: string;
+        next_action: string | null;
+        reporter_pi_session_id: string;
+        reporter_pi_session_name: string | null;
+        reporter_runtime_id: string;
+        reported_at: Date;
+      }>(
+        `INSERT INTO spool.step_reports
+           (work_id, step_id, disposition, summary, evidence_ref, next_action,
+            reporter_pi_session_id, reporter_pi_session_name,
+            reporter_pi_session_file, reporter_runtime_id, reported_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 absurd.current_time())
+         ON CONFLICT (work_id, step_id) DO UPDATE
+           SET disposition = EXCLUDED.disposition,
+               summary = EXCLUDED.summary,
+               evidence_ref = EXCLUDED.evidence_ref,
+               next_action = EXCLUDED.next_action,
+               reporter_pi_session_id = EXCLUDED.reporter_pi_session_id,
+               reporter_pi_session_name = EXCLUDED.reporter_pi_session_name,
+               reporter_pi_session_file = EXCLUDED.reporter_pi_session_file,
+               reporter_runtime_id = EXCLUDED.reporter_runtime_id,
+               reported_at = absurd.current_time()
+         RETURNING disposition, summary, evidence_ref, next_action,
+                   reporter_pi_session_id, reporter_pi_session_name,
+                   reporter_runtime_id, reported_at`,
+        [
+          binding.workId,
+          input.stepId,
+          input.disposition,
+          input.summary,
+          input.evidenceRef,
+          input.nextAction ?? null,
+          identity.piSessionId,
+          identity.piSessionName ?? null,
+          identity.piSessionFile ?? null,
+          identity.runtimeId,
+        ],
+      );
+      const row = result.rows[0]!;
+      return {
+        stepId: input.stepId,
+        disposition: row.disposition,
+        summary: row.summary,
+        evidenceRef: row.evidence_ref,
+        nextAction: row.next_action,
+        reporterPiSessionId: row.reporter_pi_session_id,
+        reporterPiSessionName: row.reporter_pi_session_name,
+        reporterRuntimeId: row.reporter_runtime_id,
+        reportedAt: row.reported_at,
+        execution: "untracked",
+        acceptance: "not_recorded",
+      };
+    }, "BEGIN ISOLATION LEVEL SERIALIZABLE");
   }
 
   async checkpoint(
@@ -572,10 +812,26 @@ export class SpoolService {
       completion_criteria: string;
       state: string;
       absurd_task_id: string | null;
+      report_disposition: "in_progress" | "finished" | null;
+      report_summary: string | null;
+      report_evidence_ref: string | null;
+      report_next_action: string | null;
+      reporter_pi_session_id: string | null;
+      reporter_pi_session_name: string | null;
+      reporter_runtime_id: string | null;
+      reported_at: Date | null;
     }>(
       `SELECT s.step_id, s.title, s.contribution, s.completion_criteria,
-              s.state, s.absurd_task_id
+              s.state, s.absurd_task_id,
+              r.disposition AS report_disposition,
+              r.summary AS report_summary,
+              r.evidence_ref AS report_evidence_ref,
+              r.next_action AS report_next_action,
+              r.reporter_pi_session_id, r.reporter_pi_session_name,
+              r.reporter_runtime_id, r.reported_at
          FROM spool.steps s
+         LEFT JOIN spool.step_reports r
+           ON r.work_id = s.work_id AND r.step_id = s.step_id
         WHERE s.work_id = $1
         ORDER BY
           CASE
@@ -675,7 +931,31 @@ export class SpoolService {
         title: step.title,
         contribution: step.contribution,
         criteria: step.completion_criteria,
-        state: step.state,
+        state: step.report_disposition
+          ? `reported_${step.report_disposition}_untracked`
+          : step.state,
+        trackedState: step.state,
+        report:
+          step.report_disposition &&
+          step.report_summary &&
+          step.report_evidence_ref &&
+          step.reporter_pi_session_id &&
+          step.reporter_runtime_id &&
+          step.reported_at
+            ? {
+                stepId: step.step_id,
+                disposition: step.report_disposition,
+                summary: step.report_summary,
+                evidenceRef: step.report_evidence_ref,
+                nextAction: step.report_next_action,
+                reporterPiSessionId: step.reporter_pi_session_id,
+                reporterPiSessionName: step.reporter_pi_session_name,
+                reporterRuntimeId: step.reporter_runtime_id,
+                reportedAt: step.reported_at,
+                execution: "untracked",
+                acceptance: "not_recorded",
+              }
+            : null,
         latestAttempt: latest
           ? {
               attemptId: latest.attempt_id,
@@ -745,21 +1025,89 @@ export class SpoolService {
     }
   }
 
-  private async lockStep(client: PoolClient, workId: string, stepId: string) {
+  private async lockStep(
+    client: PoolClient,
+    workId: string,
+    stepId: string,
+    missingError: Error = new Error(`step ${stepId} is not materialized`),
+  ) {
     const result = await client.query<{
       title: string;
       contribution: string;
       completion_criteria: string;
       absurd_task_id: string | null;
+      state: string;
+      queue_name: string;
     }>(
-      `SELECT title, contribution, completion_criteria, absurd_task_id
-         FROM spool.steps
-        WHERE work_id = $1 AND step_id = $2
-        FOR UPDATE`,
+      `SELECT s.title, s.contribution, s.completion_criteria,
+              s.absurd_task_id, s.state, w.queue_name
+         FROM spool.steps s
+         JOIN spool.works w ON w.work_id = s.work_id
+        WHERE s.work_id = $1 AND s.step_id = $2
+        FOR UPDATE OF s`,
       [workId, stepId],
     );
-    if (!result.rows[0]) throw new Error(`step ${stepId} is not materialized`);
+    if (!result.rows[0]) throw missingError;
     return result.rows[0];
+  }
+
+  private async requireSafeMismatchFallback(
+    client: PoolClient,
+    sdk: Absurd,
+    binding: SessionBinding,
+    expectedStepId: string,
+    sessionHasExpiredAttempt: boolean,
+  ): Promise<{ absurdTaskId: string }> {
+    if (sessionHasExpiredAttempt) {
+      throw new LostOwnershipError(
+        "this Pi session has an expired active attempt; inspect lost ownership before treating queue mismatch as optional",
+      );
+    }
+    const intended = await this.lockStep(
+      client,
+      binding.workId,
+      expectedStepId,
+    );
+    if (
+      intended.queue_name !== this.queueName ||
+      !intended.absurd_task_id ||
+      intended.state === "execution_completed"
+    ) {
+      throw new ClaimConflictError(
+        `intended step ${expectedStepId} is not a ready admitted task; queue-head claim rolled back`,
+      );
+    }
+    const active = await client.query<{ lease_valid: boolean }>(
+      `SELECT lease_expires_at > absurd.current_time() AS lease_valid
+         FROM spool.attempts
+        WHERE work_id = $1 AND step_id = $2 AND state = 'active'
+        FOR UPDATE`,
+      [binding.workId, expectedStepId],
+    );
+    if (active.rows.some((attempt) => attempt.lease_valid)) {
+      throw new LostOwnershipError(
+        `intended step ${expectedStepId} has a valid active owner; queue mismatch cannot be treated as optional tracking`,
+      );
+    }
+    if (active.rows.length > 0) {
+      throw new LostOwnershipError(
+        `intended step ${expectedStepId} has an expired active attempt; inspect lost ownership before retrying`,
+      );
+    }
+    if (intended.state !== "ready") {
+      throw new ClaimConflictError(
+        `intended step ${expectedStepId} is ${intended.state} without a verifiable active owner; queue-head claim rolled back`,
+      );
+    }
+    const task = await sdk.fetchTaskResult(intended.absurd_task_id, {
+      queue: this.queueName,
+    });
+    if (!task || task.state !== "pending") {
+      throw new ClaimConflictError(
+        `intended step ${expectedStepId} is not durably pending in the configured queue; ownership status is ambiguous and the queue-head claim was rolled back`,
+      );
+    }
+    return { absurdTaskId: intended.absurd_task_id };
   }
 
   private async requireOwnedAttempt(
@@ -854,6 +1202,7 @@ export class SpoolService {
 
   private async transaction<T>(
     operation: (client: PoolClient) => Promise<T>,
+    beginSql = "BEGIN",
   ): Promise<T> {
     let client: PoolClient;
     try {
@@ -866,7 +1215,7 @@ export class SpoolService {
     let commitAttempted = false;
     let discardClient = false;
     try {
-      await client.query("BEGIN");
+      await client.query(beginSql);
       transactionStarted = true;
       const result = await operation(client);
       commitAttempted = true;
@@ -874,15 +1223,27 @@ export class SpoolService {
       return result;
     } catch (error) {
       const databaseFailure = isDatabaseFailure(error);
+      let rollbackFailed = false;
       if (transactionStarted) {
-        await client.query("ROLLBACK").catch(() => undefined);
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          rollbackFailed = true;
+        }
       }
-      discardClient = databaseFailure;
-      if (commitAttempted && databaseFailure) {
+      if (commitAttempted) {
+        discardClient = true;
         throw new SpoolDatabaseError(
           "Spool lost the database commit acknowledgement; the durable outcome is uncertain. Inspect Spool state before retrying and do not automatically repeat the mutation.",
         );
       }
+      if (rollbackFailed) {
+        discardClient = true;
+        throw new SpoolDatabaseError(
+          "Spool could not confirm database rollback; the durable outcome is uncertain. Inspect Spool state before retrying and do not treat tracking as unavailable.",
+        );
+      }
+      discardClient = databaseFailure;
       throw spoolUserFacingError(error);
     } finally {
       client.release(discardClient);
@@ -1014,6 +1375,16 @@ function deriveNextAction(steps: ResumePacket["steps"]): string {
     return `Inspect queue and explicitly reclaim step ${attributedExpired.stepId}`;
   }
 
+  const reportedInProgress = steps.find(
+    (step) => step.state === "reported_in_progress_untracked",
+  );
+  if (reportedInProgress) {
+    return (
+      reportedInProgress.report?.nextAction ??
+      `Continue step ${reportedInProgress.stepId} as reported untracked execution`
+    );
+  }
+
   const running = steps.find((step) => step.state === "running");
   if (running) {
     if (running.latestAttempt?.leaseValid) {
@@ -1047,6 +1418,15 @@ export function boundResumePacket(packet: ResumePacket): ResumePacket {
       title: fit(step.title, 200)!,
       contribution: fit(step.contribution, 500)!,
       criteria: fit(step.criteria, 500)!,
+      report: step.report
+        ? {
+            ...step.report,
+            summary: fit(step.report.summary, 500)!,
+            evidenceRef: fit(step.report.evidenceRef, 1_000)!,
+            nextAction: fit(step.report.nextAction, 500),
+            reporterPiSessionName: fit(step.report.reporterPiSessionName, 200),
+          }
+        : null,
       latestAttempt: step.latestAttempt
         ? {
             ...step.latestAttempt,

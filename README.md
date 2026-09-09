@@ -1,7 +1,6 @@
 # pi-spool
 
-Experimental Pi durable-work package for ALD-1. Release `0.1.0-experimental.1`
-provides one agent-facing `spool` tool and a narrow single-agent loop:
+Experimental Pi durable-work package for ALD-1. Release `0.1.0-experimental.1` provides one agent-facing `spool` tool, a read-only `/spool` browser, and a narrow single-agent loop:
 
 ```text
 attach canonical PKM goal
@@ -71,6 +70,12 @@ chmod 600 ~/.pi/agent/spool.json
 
 Configuration never selects a project/profile, routes queues dynamically, applies schemas, creates queues, or attaches work. Spool remains opt-in: the agent must explicitly call `attach`; the extension does not observe, track, or mutate ordinary work automatically.
 
+## Tracking versus work authority
+
+Spool records optional continuity; it does not grant authority to begin coding, launch peers, or cause external effects. User approval and the normal coordinator/worker ownership contract authorize the underlying work. A successful Spool claim authorizes mutations only to that owned execution record.
+
+When an explicit intended step is verified ready and unowned but another admitted item is at the queue head, `claim` confirms rollback and returns the non-error result `claimed:false`, `tracking:"unavailable"`, `reason:"queue_head_mismatch"`, and `rollback:"confirmed"`, with intended/head references and a `nextAction`. Report it once, then continue otherwise authorized work through normal coordination and describe it as untracked. Do not repeatedly claim, sweep, reorder, cancel, take unrelated work, or hold other agents merely to satisfy Spool. If the user explicitly requires strict tracking, pause and ask. A missing explicit intended step, invalid admission, real same-step owner, lost lease, storage or rollback failure, and uncertain external effect/commit remain hard errors.
+
 ## Local Docker database
 
 ```bash
@@ -89,7 +94,7 @@ On a **fresh volume**, the official Postgres entrypoint applies these files in o
 2. `sql/spool.sql` — the extension-owned tables;
 3. `sql/dev-queue.sql` — creates the unpartitioned `spool_dev` queue.
 
-This follows Absurd's supported [direct SQL onboarding](https://github.com/earendil-works/absurd/blob/550d3b9e6f9382d96178de6ab8c90c7f8edf2227/docs/database.md). No checkout, `absurdctl` installation, or schema download is needed. Initialization files do **not** run again on an existing volume; future schema changes need an explicit migration, not merely a restart. Inspect failures with `docker compose logs postgres`.
+This follows Absurd's supported [direct SQL onboarding](https://github.com/earendil-works/absurd/blob/550d3b9e6f9382d96178de6ab8c90c7f8edf2227/docs/database.md). No checkout, `absurdctl` installation, or schema download is needed. Initialization files do **not** run again on an existing volume. Existing reviewed installations must explicitly apply `sql/migrations/001-step-reports.sql` before using `report`; this migration is not applied automatically and must not be run against a live database without separate approval and backup. Inspect failures with `docker compose logs postgres`.
 
 ```bash
 docker compose stop          # stop; keep container and data
@@ -107,6 +112,29 @@ When PostgreSQL is absent, stopped, unreachable, or a statement blocks, the tool
 
 A timeout only bounds how long Spool waits. It does not prove that a server-side effect failed, and a lost `COMMIT` acknowledgement may mean the transaction committed. Spool reports that outcome as uncertain; inspect state before repeating the action. The client query-read timeout is not claimed to cancel an effect that the server may already have committed.
 
+## Read-only `/spool` browser
+
+In interactive Pi, type `/spool` to open a centered, theme-aware read-only workflow browser outside the input editor. Goal titles and optional Goal text are attributed from the exact recorded canonical PKM task file when its frontmatter ID matches. Missing, moved, malformed, mismatched, relative, or oversized references fall back visibly to the recorded vault/task ID and Spool purpose without blocking database browsing.
+
+The goal list shows PKM titles when verified, Spool-tracked state counts, and last recorded Spool activity. Activity outside Spool is not recorded or inferred and remains unknown; `ready` with `no tracked attempt` does not assert that nobody is working. Labeled navigation and selected-preview sections are separated by a subtle divider, while controls use two bounded footer rows so the main actions remain visible. A selected-goal preview wraps the full recorded Spool purpose. The step list keeps human titles primary and previews the full contribution plus useful next action. Step detail leads with meaning and activity; raw queue/work/session IDs, attempt numbers, lease timestamps, and paths stay behind the `i` technical-details toggle. Execution completion remains visually and textually distinct from review/acceptance.
+
+Controls:
+
+- `↑` / `↓`: move through goals or steps; scroll detail and PKM reference panels.
+- `PgUp` / `PgDn`: scroll a selected goal/step preview without changing selection.
+- `Enter`: inspect the selected workflow or step.
+- `s`: cycle `attention` → `recent` → `oldest`; sorting is applied before the 50-record display bound.
+- `p`: open the read-only PKM attribution/reference panel.
+- `i`: toggle technical metadata in step detail.
+- `r`: explicitly refresh the snapshot or retry a failed load; there is no polling.
+- `Esc`: go back one modal; from the goal list, close.
+
+Opening or navigating the browser never attaches a goal, changes the current session binding, claims/sweeps work, renews a lease, opens evidence, or infers acceptance. It makes no LLM call and does not poll. Every database load uses an independent `REPEATABLE READ, READ ONLY` PostgreSQL transaction and closes its bounded pool when the command exits. PKM attribution reads at most 64 KiB from each exact stored absolute path, validates the recorded task ID with Pi's public frontmatter parser, and is cached only within the current manual snapshot. The `p` panel never opens a process or edits a file.
+
+Goal and step counts are calculated independently of the display window. The UI shows at most 50 goal groups, 10 recorded work scopes per grouped vault/task ID, and 50 steps for the selected goal, with omissions disclosed. `attention` prioritizes active, expired-active, and ready records before recency; `recent` and `oldest` use last recorded activity, which may include a lease heartbeat and is not portrayed as time spent or evidence time. Deterministic ID tie-breaks apply before limits. Duplicate work IDs under one vault/task ID remain distinct. Counts describe recorded execution state and participating sessions—not percentage goal progress, research duration, or AI coverage.
+
+The command requires interactive TUI mode. In non-interactive Pi modes it reports that no TUI is available. Database errors remain on an explicit error screen until `r` or `Esc`; there is no automatic retry.
+
 ## Tool contract
 
 The single `spool` tool has these actions:
@@ -115,8 +143,8 @@ The single `spool` tool has these actions:
   `id`, then store only vault/task/path plus a concise outcome.
 - `materialize`: admit one stable step with title, contribution, and completion
   criteria. Transactional SDK spawn uses a stable idempotency key.
-- `claim`: claim the **next** ready queue item, optionally checking an expected
-  step. A mismatch rolls back the entire claim and is surfaced.
+- `claim`: claim the **next** ready queue item, optionally checking an expected step. A verified safe expected-step mismatch returns the typed non-error unavailable result described above only after rollback succeeds. Missing or ambiguous intent, ownership, admission, lease, storage, rollback, and commit uncertainty remain errors. A no-item poll remains the existing separate `claimed:false` result and may reflect an expired-run sweep; it is not a queue-mismatch fallback.
+- `report`: attribute `in_progress` or `finished` untracked execution to one explicit already-materialized step, with reporter identity from Pi context, database time, summary, evidence, and optional next action. On the first report, a serializable transaction verifies the step is unclaimed/pending and uses Absurd's supported cancellation API to withdraw only its own task before writing the report. Active/expired ownership, state/admission/cancellation races, and rollback uncertainty fail closed. Follow-up reports update attribution without another queue effect. Reports create no attempt and never imply verified truth or acceptance.
 - `checkpoint`: persist a bounded evidence reference and next action while the
   current session/runtime still owns a valid lease.
 - `heartbeat`: explicitly renew a still-valid lease. There is no idle timer.
@@ -165,8 +193,8 @@ Automated tests cover:
 - one-tool registration, resource-lazy startup, and idempotent shutdown;
 - stable step admission/spawn without duplicate Absurd tasks;
 - claim plus Spool attempt correlation in one transaction;
-- a two-ready-item head mismatch whose claim rolls back without stealing or
-  stranding either task;
+- a two-goal, two-ready-item head mismatch that returns the stable typed unavailable result without changing either task/run, creating an attempt, changing the binding, or retrying automatically;
+- a real intended-step owner hidden behind an unrelated ready head, invalid head admission, and simulated rollback failure all remaining hard errors;
 - checkpoint/status/resume reconstruction from a fresh service instance;
 - owned-active, expired-active, foreign-runtime, and ready-step next-action
   priority without treating an expired attribution as usable ownership;
@@ -189,11 +217,7 @@ Automated tests cover:
   steps and 20 checkpoints per selected latest attempt, then enforces the byte
   cap. Omission/truncation counts are explicit, but v0 has no pagination or
   narrow-history query yet.
-- **Prefer one active goal.** All work currently shares one configured queue,
-  and claim is queue-first rather than by nominated task ID. Another goal's
-  queue head can block the attached goal; on mismatch Spool rolls back and
-  stops. It does not defer, loop, reassign, create per-step queues, or schedule
-  around the conflict.
+- **Prefer one active goal.** All work currently shares one configured queue, and claim is queue-first rather than by nominated task ID. Another goal's queue head can block optional tracking; on expected-step mismatch Spool rolls back and acquires no ownership. Report the limitation once and continue otherwise authorized work untracked unless strict tracking was explicitly required. Spool does not defer, loop, reassign, create per-step queues, or schedule around the conflict.
 - **Expiry requires an explicit re-poll.** Spool refuses to renew or mutate once
   its conservatively recorded lease expires. The same runtime may explicitly
   recover: a valid active attempt blocks duplicate claim, while an expired one

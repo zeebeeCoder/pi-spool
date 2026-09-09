@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Absurd returns as the execution layer for unattended pods. `worker/pod.ts`
+  runs a headless Pi session as Absurd task `spool-pod` on queue `spool_pods`
+  with per-message checkpoints, retry, and an awaitable result; Spool records
+  start, retry, and done. The vendored schema lives in `sql/vendor` with a
+  checksum test, and compose installs it plus the queue on a fresh volume.
+- Phase 1 kill test passed: SIGKILL at message 17, attempt 2 resumed from the
+  same session file with no repeated tool call.
+
 ## 0.2.0-experimental.1 — 2026-09-09
 
 Thin work log. Replaces the Absurd-backed lease and claim protocol.

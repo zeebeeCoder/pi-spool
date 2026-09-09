@@ -113,6 +113,33 @@ add a line to the project's `CLAUDE.md` pointing at these commands; no MCP
 server is needed for a three-verb log. An MCP wrapper would be about forty
 lines over `SpoolService` if native tool calls are wanted later.
 
+## Unattended pods on Absurd (phase 1)
+
+Interactive sessions are traced by the three verbs. Unattended work runs as
+Absurd tasks, where Absurd supplies what a laptop otherwise lacks: a lease,
+retry after the process dies, per-message checkpoints, and an awaitable
+result. The pod's own Pi session file remains the message log; on retry the
+pod reopens it and continues.
+
+```bash
+npm run pod -- serve                                    # worker on queue spool_pods
+npm run pod -- spawn --task ALD-1 --step ald1.smoke \
+  --assignment "Read README.md and summarise it." --cwd $PWD --tools read --wait
+npm run pod -- status <taskID>
+```
+
+Each pod writes a Spool `note` when it starts, a note on every retry, and
+`done` when it finishes, so it appears beside human sessions in `/spool`.
+`POD_CLAIM_TIMEOUT` sets the lease in seconds (default 300); a heartbeat runs
+after every message. A fresh compose volume installs the vendored Absurd
+schema (`sql/vendor`, checksum-tested) and the `spool_pods` queue. On an
+existing volume run `select absurd.create_queue('spool_pods','unpartitioned')`.
+
+Phase 1 evidence on 2026-09-09: a pod killed with SIGKILL at message 17
+resumed on attempt 2 from the same session file with no repeated tool call.
+Phases 2 (coordinator fan-out with awaited results) and 3 (review gate via
+`awaitEvent`) are next.
+
 ## Storage
 
 Three tables in schema `spool`: `works` (one per vault and task ID), `steps`

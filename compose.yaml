@@ -12,8 +12,10 @@ services:
       - "127.0.0.1:55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Applied by the official entrypoint on a fresh volume only.
-      - ./sql/spool.sql:/docker-entrypoint-initdb.d/01-spool.sql:ro
+      # Applied by the official entrypoint on a fresh volume only, in order.
+      - ./sql/vendor/absurd-0.5.0.sql:/docker-entrypoint-initdb.d/01-absurd.sql:ro
+      - ./sql/spool.sql:/docker-entrypoint-initdb.d/02-spool.sql:ro
+      - ./sql/pods-queue.sql:/docker-entrypoint-initdb.d/03-pods-queue.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U spool -d spool"]
       interval: 2s

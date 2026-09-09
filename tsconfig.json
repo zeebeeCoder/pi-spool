@@ -17,8 +17,9 @@
     ]
   },
   "include": [
+    "bin/**/*.ts",
     "src/**/*.ts",
     "test/**/*.ts",
-    "bin/**/*.ts"
+    "worker/**/*.ts"
   ]
 }

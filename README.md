@@ -1,177 +1,124 @@
 # pi-spool
 
-Experimental Pi extension: a thin work log for PKM goals. An agent working on a
-task file calls one tool, `spool`, with three actions, so that a later session
-can pick the work up where it stopped. A read-only `/spool` browser shows the
-log to humans.
+A [Pi](https://pi.dev) extension that keeps a work log for a goal in Postgres,
+so a later session, or another agent, can see what was done and continue.
+Unattended work can run as [Absurd](https://github.com/earendil-works/absurd)
+tasks on the same database and survive the process dying.
 
-```text
-resume (attach the task file)  →  note … note  →  done
-```
+The goal is a task file with an `id` in its frontmatter. Steps are named by
+the agent as it goes. Every note carries the session that wrote it.
 
-Spool never blocks or authorizes work. The PKM task file is the goal, Git is
-the implementation evidence, the Pi transcript is the conversation, and Spool
-is the short durable trail between sessions.
+## Why
 
-## Why v2 replaced the Absurd-backed v1
+This is not another sub-agent framework or workflow engine. How agents
+collaborate is your choice: sub-agents, a flat fleet of peers, or sessions
+talking over an intercom. Whatever the shape, at some point you want a ledger
+that attributes every session's work to the goal or spec it served. Spool is
+that ledger. Composition stays yours.
 
-v1 layered a lease and claim protocol over Absurd, a Postgres job queue. One
-shared FIFO queue meant any goal's unclaimed step blocked every other goal, a
-mismatched claim rolled back the expiry sweep so stale leases never cleared,
-and the nine-action protocol consumed agent attention that belonged on the
-goal. v2 keeps the useful part, a durable per-step trail with session
-attribution, and drops queues, leases, claims, heartbeats, and the dependency.
-See `CHANGELOG.md`.
+![resume, note, done](docs/figures/spool-1-three-verbs.png)
 
-## Install and verify
+## The tool
 
-Requirements: Node 22.18+ and a Docker daemon for tests.
+| action | what it does | fields |
+|---|---|---|
+| `resume` | With no attached goal: every goal, its current step, next action. With `canonicalPath`: attach a task file and return its steps. With `taskId`: read another goal without attaching. | `canonicalPath` `vault` `outcome` `taskId` `scope` |
+| `note` | Record progress on a step and what to do next. A new `stepId` creates the step. | `stepId` `summary` `title` `evidenceRef` `nextAction` |
+| `done` | Mark a step finished. `reviewed` is false until a human sets it. | `stepId` `summary` `evidenceRef` `reviewed` |
 
-```bash
-npm ci
-npm run typecheck
-npm test
-```
+Output is JSON, capped at 20 goals, 12 steps, 6 KB. If another session wrote
+to the same step in the last hour the result carries a `warning`; the write
+still lands. Spool never refuses a write and never blocks work.
 
-Tests start disposable `postgres:16-alpine` Testcontainers, including one that
-applies the v1 to v2 migration against a v1 schema.
+`/spool` inside Pi opens a read-only browser over the same data. Outside Pi
+the CLI does the same three things:
 
 ```bash
-pi install /absolute/path/to/pi-spool   # local path package; edits are live
-pi remove /absolute/path/to/pi-spool
+npm run spool -- resume
+npm run spool -- resume --task NFN-4
+npm run spool -- note --task ALD-1 --step s1 --summary "Drafted" --next "Review"
+npm run spool -- done --task ALD-1 --step s1 --summary "Accepted" --reviewed
 ```
 
-## Configuration
+Identity for the CLI comes from `SPOOL_SESSION_ID` and `SPOOL_SESSION_NAME`.
 
-`~/.pi/agent/spool.json`:
+## How it fits together
+
+![Goal, sessions, extension, service, storage](docs/figures/spool-2-layers.png)
+
+Interactive sessions write notes through the tool or the CLI. Unattended pods
+write the same notes at their boundaries and run on Absurd underneath.
+
+## Pods on Absurd
+
+A pod is a headless Pi session run as an Absurd task. The pod's session file
+is the message log. Absurd adds a lease, a checkpoint per message, a retry
+when the process dies, and a result the caller can await.
+
+```bash
+npm run pod -- serve --concurrency 3
+npm run pod -- spawn  --task ALD-1 --step s1 --assignment "…" --cwd $PWD --tools read --wait
+npm run pod -- fanout --task ALD-1 --step s2 --plan pods.json --worktree-base ../.worktrees --wait
+```
+
+`fanout` runs a coordinator as a task on its own queue: one git worktree per
+pod, one spawn per pod with an idempotency key, one checkpointed wait per
+result. `pods.json` is an array of `{stepId, title, assignment, tools?, cwd?}`.
+
+This is a real run with the worker killed at twenty seconds. All four tasks
+resumed; thirty-six file reads, none repeated.
+
+![Fan-out, kill, resume](docs/figures/spool-3-fanout-kill-resume.png)
+
+## Absurd, briefly
+
+Queue, task, run, checkpoint. Checkpoints belong to the task, so a retry
+inherits them.
+
+![Queue, task, runs, checkpoints](docs/figures/absurd-1-hierarchy.png)
+
+A run holds a lease. If the heartbeat stops, the next claim sweeps it and a
+new run continues from the same checkpoints.
+
+![Run state machine](docs/figures/absurd-2-run-lifecycle.png)
+
+Every model turn is a checkpoint. After a crash the next attempt replays the
+stored turns and pays only for the ones that never happened.
+
+![Agent loop replay after a crash](docs/figures/absurd-3-agent-loop.png)
+
+Parents spawn and await children; a task can sleep on an event until a human
+emits it. Parents and children use separate queues.
+
+![Parent, child, human, Postgres](docs/figures/absurd-4-coordination.png)
+
+Background: Armin Ronacher's
+[announcement](https://lucumr.pocoo.org/2025/11/3/absurd-workflows/) and
+[production notes](https://lucumr.pocoo.org/2026/4/4/absurd-in-production/).
+
+## Setup
+
+Node 22.18+ and Docker.
+
+```bash
+docker compose up -d --wait      # Postgres 16 on 127.0.0.1:55432; fresh volume gets both schemas and the queues
+npm ci && npm test               # Testcontainers; no host database touched
+pi install /absolute/path/to/pi-spool
+```
+
+`~/.pi/agent/spool.json`, or `SPOOL_DATABASE_URL`:
 
 ```json
 { "databaseUrl": "postgresql://spool:spool@127.0.0.1:55432/spool" }
 ```
 
-`SPOOL_DATABASE_URL` overrides the file. A leftover v1 `queueName` key is
-ignored. The file is read lazily on the first `spool` call; loading Pi opens no
-connection. Protect the file (`chmod 600`) because the URL may hold credentials.
-
-## Local database
-
-```bash
-docker compose up -d --wait
-```
-
-Starts Postgres 16 on `127.0.0.1:55432` with user, password, and database
-`spool`. A fresh volume gets `sql/spool.sql`. An existing v1 volume keeps its
-data; apply the migration once, after a backup:
-
-```bash
-docker compose exec -T postgres psql -U spool -d spool -1 -f - \
-  < sql/migrations/002-thin-events.sql
-```
-
-The migration is additive. It creates `spool.events`, relaxes v1 columns, and
-backfills events from v1 attempts, reports, and Absurd checkpoints. It leaves
-the v1 tables and the `absurd` schema in place so nothing is lost.
-
-## Tool
-
-One tool, `spool`, three actions:
-
-| action | required | optional | effect |
-|---|---|---|---|
-| `resume` | | `canonicalPath`, `vault`, `outcome`, `taskId`, `scope` | No attached goal, or `scope: "all"`: overview of every goal with counts, current step, next action, and task path. `canonicalPath`: attach the PKM task (ID from frontmatter `id`, vault from a `vaults/<name>/` path segment) and return its view. `taskId`: read another goal without attaching. |
-| `note` | `stepId`, `summary` | `title`, `evidenceRef`, `nextAction` | Appends progress. An unknown `stepId` creates the step. |
-| `done` | `stepId`, `summary` | `evidenceRef`, `reviewed` | Marks the step finished. `reviewed` defaults to false. |
-
-Results are small JSON. The overview returns at most 20 goals. A goal view returns at most 12 steps, open ones first,
-text fields cut at 240 characters, and the whole packet under 6 KB with an
-`omittedSteps` count. `note` and `done` may carry a `warning` when another
-session touched the same step in the last hour or the step was already done.
-Warnings are advisory. Nothing in Spool refuses a write.
-
-Identity comes from Pi context: session ID, session name, session file. The
-binding to a goal is stored as a custom session entry and restored on session
-start without opening the database.
-
-## Using it outside Pi (Claude Code, shell, cron)
-
-`bin/spool.ts` wraps the same service with the same three actions and writes
-to the same database, so any agent that can run a shell command can read and
-append to the log. Identity comes from `SPOOL_SESSION_ID` and
-`SPOOL_SESSION_NAME`; without them it is `<user>@<host>:<pid>`.
-
-```bash
-npm run spool -- resume                                   # overview of all goals
-npm run spool -- resume --task NFN-4                      # peek at one goal
-npm run spool -- resume --path ~/vaults/zeebs_sb/tasks/2026/09/ALD-1.md
-npm run spool -- note --task ALD-1 --step ald1.thin-v2 \
-  --summary "Ready for review" --evidence "git:abc123" --next "Reviewer runs npm test"
-npm run spool -- done --task ALD-1 --step ald1.thin-v2 --summary "Accepted" --reviewed
-```
-
-Output is JSON. For Claude Code, set `SPOOL_SESSION_ID` to its session ID and
-add a line to the project's `CLAUDE.md` pointing at these commands; no MCP
-server is needed for a three-verb log. An MCP wrapper would be about forty
-lines over `SpoolService` if native tool calls are wanted later.
-
-## Unattended pods on Absurd (phase 1)
-
-Interactive sessions are traced by the three verbs. Unattended work runs as
-Absurd tasks, where Absurd supplies what a laptop otherwise lacks: a lease,
-retry after the process dies, per-message checkpoints, and an awaitable
-result. The pod's own Pi session file remains the message log; on retry the
-pod reopens it and continues.
-
-```bash
-npm run pod -- serve                                    # worker on queue spool_pods
-npm run pod -- spawn --task ALD-1 --step ald1.smoke \
-  --assignment "Read README.md and summarise it." --cwd $PWD --tools read --wait
-npm run pod -- status <taskID>
-```
-
-Each pod writes a Spool `note` when it starts, a note on every retry, and
-`done` when it finishes, so it appears beside human sessions in `/spool`.
-`POD_CLAIM_TIMEOUT` sets the lease in seconds (default 300); a heartbeat runs
-after every message. A fresh compose volume installs the vendored Absurd
-schema (`sql/vendor`, checksum-tested) and the `spool_pods` queue. On an
-existing volume run `select absurd.create_queue('spool_pods','unpartitioned')`.
-
-A coordinator can fan out to several pods and await them, as an Absurd task
-on its own queue so it survives dying too:
-
-```bash
-npm run pod -- fanout --task ALD-1 --step ald1.review-pack \
-  --plan pods.json --worktree-base ../.worktrees/pi-spool --wait
-```
-
-`pods.json` is an array of `{stepId, title, assignment, tools?, cwd?}`. The
-coordinator creates one detached git worktree per pod (once, checkpointed),
-spawns each pod with an idempotency key, awaits each result through a
-checkpointed wait, and records a Spool `done` listing every pod's state.
-
-Evidence on 2026-09-09. Phase 1: a pod SIGKILLed at message 17 resumed on
-attempt 2 from the same session file with no repeated tool call. Phase 2:
-SIGKILL with the coordinator and three pods running; all four resumed on
-attempt 2, each pod finished its twelve reads with none repeated, and the
-coordinator reported 3/3. Phase 3, a review gate via `awaitEvent`, is next.
-
-## Storage
-
-Three tables in schema `spool`: `works` (one per vault and task ID), `steps`
-(ID and title), and `events` (append-only notes and done markers with session
-attribution). State is derived from the latest event per step. Every write is
-one short transaction. Connection, statement, and query timeouts are bounded;
-a lost commit acknowledgement is reported as uncertain rather than retried.
-
-## `/spool` browser
-
-Interactive Pi only. Goals sorted by last activity, then steps with open ones
-first, then a step's full history newest first. `p` opens the PKM task
-reference, `r` refreshes, `Esc` goes back. Reads use a repeatable-read,
-read-only transaction and never write.
+Nothing connects until the first `spool` call. Upgrading a v1 database:
+apply `sql/migrations/002-thin-events.sql` once after a backup, then create
+the `spool_pods` and `spool_fanout` queues with `absurd.create_queue`.
 
 ## Limits
 
-- No pagination beyond the 12-step resume window and 100-event history view.
-- No enforcement of exclusive ownership; peers are warned, not stopped.
-- No acceptance workflow; `reviewed` is a flag the caller sets.
-- The local path install tracks the working tree, not a tagged artifact.
+- Peers are warned, not locked out. Two sessions can note the same step.
+- `reviewed` is a flag, not a workflow.
+- The review gate for pods (`awaitEvent`) is not built yet.
+- Experimental. A local-path install tracks the working tree.

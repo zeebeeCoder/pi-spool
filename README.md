@@ -40,7 +40,18 @@ npm run spool -- note --task ALD-1 --step s1 --summary "Drafted" --next "Review"
 npm run spool -- done --task ALD-1 --step s1 --summary "Accepted" --reviewed
 ```
 
-Identity for the CLI comes from `SPOOL_SESSION_ID` and `SPOOL_SESSION_NAME`.
+CLI identity, first match wins: `--session`/`--name`, `SPOOL_SESSION_ID`/
+`SPOOL_SESSION_NAME`, `CLAUDE_SESSION_ID`, or a fallback that is stable per
+directory and day.
+
+A Claude Code skill wraps the CLI. Install it with a symlink:
+
+```bash
+ln -s "$PWD/claude/skills/spool" ~/.claude/skills/spool
+```
+
+It covers overview, one goal plus its spec file, note, and done, and hands
+task creation and status changes to `pkm task`.
 
 ## How it fits together
 

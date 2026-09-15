@@ -6,8 +6,13 @@
 //   node bin/spool.ts note --task <ID> --step <id> --summary <text> [--title t] [--evidence ref] [--next text] [--vault v]
 //   node bin/spool.ts done --task <ID> --step <id> --summary <text> [--evidence ref] [--reviewed] [--vault v]
 //
-// Identity: SPOOL_SESSION_ID (default: <user>@<host>:<pid>), SPOOL_SESSION_NAME.
+// Identity, first match wins:
+//   --session <id> / --name <name>
+//   SPOOL_SESSION_ID / SPOOL_SESSION_NAME
+//   CLAUDE_SESSION_ID (name "claude-code")
+//   <user>@<host>:<cwd basename>:<YYYY-MM-DD>   stable across calls in one directory and day
 import { hostname, userInfo } from "node:os";
+import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { readCanonicalTaskReference } from "../src/binding.ts";
 import { readSpoolConfig } from "../src/config.ts";
@@ -27,13 +32,23 @@ const { positionals, values } = parseArgs({
     next: { type: "string" },
     reviewed: { type: "boolean", default: false },
     outcome: { type: "string" },
+    session: { type: "string" },
+    name: { type: "string" },
   },
 });
 
 const action = positionals[0];
+const claudeSession = process.env.CLAUDE_SESSION_ID;
 const identity: RuntimeIdentity = {
-  piSessionId: process.env.SPOOL_SESSION_ID ?? `${userInfo().username}@${hostname()}:${process.pid}`,
-  piSessionName: process.env.SPOOL_SESSION_NAME ?? null,
+  piSessionId:
+    values.session ??
+    process.env.SPOOL_SESSION_ID ??
+    (claudeSession ? `claude-code:${claudeSession}` : undefined) ??
+    `${userInfo().username}@${hostname()}:${basename(process.cwd())}:${new Date().toISOString().slice(0, 10)}`,
+  piSessionName:
+    values.name ??
+    process.env.SPOOL_SESSION_NAME ??
+    (claudeSession ? "claude-code" : null),
   piSessionFile: null,
   runtimeId: "00000000-0000-4000-8000-00000000c11e",
 };

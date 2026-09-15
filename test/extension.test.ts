@@ -455,5 +455,5 @@ test("binding-dependent tool calls are serialized", async () => {
 
 test("rendered output stays within the tool bound", () => {
   assert.match(renderSpoolResult("note", { recorded: "note" }), /^Spool note:\n\{"recorded":"note"\}$/);
-  assert.throws(() => renderSpoolResult("resume", { big: "x".repeat(9_000) }), /output bound/);
+  assert.throws(() => renderSpoolResult("resume", { big: "x".repeat(17_000) }), /output bound/);
 });

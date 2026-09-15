@@ -4,7 +4,8 @@ import type { SessionBinding } from "./binding.ts";
 import type { SpoolConfig } from "./config.ts";
 
 export const MAX_RESUME_STEPS = 12;
-export const MAX_OVERVIEW_GOALS = 20;
+export const MAX_OVERVIEW_GOALS = 40;
+export const MAX_OVERVIEW_BYTES = 14_000;
 export const MAX_RESUME_TEXT_CHARS = 240;
 export const MAX_RESUME_PACKET_BYTES = 6_000;
 export const PEER_ACTIVITY_WINDOW_MINUTES = 60;
@@ -350,7 +351,7 @@ export class SpoolService {
       vault: row.vault,
       taskId: row.pkm_task_id,
       canonicalPath: row.canonical_path,
-      outcome: truncate(row.outcome, 140),
+      outcome: truncate(row.outcome, 100),
       openSteps: Number(row.open_steps),
       doneSteps: Number(row.done_steps),
       sessions: Number(row.sessions),
@@ -359,9 +360,9 @@ export class SpoolService {
         row.step_id && row.title && row.summary && row.pi_session_id && row.recorded_at
           ? {
               stepId: row.step_id,
-              title: truncate(row.title, 120),
-              summary: truncate(row.summary, 160),
-              nextAction: row.next_action ? truncate(row.next_action, 160) : null,
+              title: truncate(row.title, 80),
+              summary: truncate(row.summary, 120),
+              nextAction: row.next_action ? truncate(row.next_action, 120) : null,
               session: row.pi_session_name ?? shortId(row.pi_session_id),
               mine: row.pi_session_id === identity.piSessionId,
               recordedAt: row.recorded_at.toISOString(),
@@ -375,7 +376,7 @@ export class SpoolService {
       omittedGoals: Math.max(0, total - goals.length),
     };
     while (
-      Buffer.byteLength(JSON.stringify(packet), "utf8") > MAX_RESUME_PACKET_BYTES &&
+      Buffer.byteLength(JSON.stringify(packet), "utf8") > MAX_OVERVIEW_BYTES &&
       packet.goals.length > 1
     ) {
       packet.goals.pop();

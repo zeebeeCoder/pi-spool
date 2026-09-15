@@ -380,7 +380,7 @@ export function registerSpoolExtension(
   }
 }
 
-export const MAX_TOOL_OUTPUT_BYTES = 8_000;
+export const MAX_TOOL_OUTPUT_BYTES = 16_000;
 
 export function renderSpoolResult(
   action: string,

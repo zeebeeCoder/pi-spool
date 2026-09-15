@@ -26,7 +26,7 @@ that ledger. Composition stays yours.
 | `note` | Record progress on a step and what to do next. A new `stepId` creates the step. | `stepId` `summary` `title` `evidenceRef` `nextAction` |
 | `done` | Mark a step finished. `reviewed` is false until a human sets it. | `stepId` `summary` `evidenceRef` `reviewed` |
 
-Output is JSON, capped at 20 goals, 12 steps, 6 KB. If another session wrote
+Output is JSON, capped at 40 goals and 14 KB for an overview, 12 steps and 6 KB for one goal. If another session wrote
 to the same step in the last hour the result carries a `warning`; the write
 still lands. Spool never refuses a write and never blocks work.
 
